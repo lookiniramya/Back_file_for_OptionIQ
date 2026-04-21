@@ -71,6 +71,21 @@ st.markdown("""<style>
 .factor-pill { display:inline-block; background:#e8eaf6; border:1px solid #c5cae9; border-radius:20px; padding:.3rem .8rem; margin:.2rem; font-size:.72rem; color:#3949ab; font-weight:500; }
 .news-item { border-left:3px solid #c5cae9; padding:.5rem .8rem; margin:.4rem 0; background:#f8f9ff; border-radius:0 6px 6px 0; }
 .sentiment-bar { height:14px; border-radius:7px; background:#e8eaf6; margin:.5rem 0; position:relative; overflow:hidden; }
+
+/* ── Auto-refresh smoothness overrides ─────────────────────────────────
+   Streamlit's default rerun behavior greys out the whole page every time
+   the script re-runs. At a 5s cadence this feels terrible. These overrides
+   keep the UI responsive during auto-refresh reruns. */
+[data-testid="stStatusWidget"] { display:none !important; }     /* top-right "Running" */
+[data-testid="stHeader"] button[kind="header"] { opacity:0.3; }  /* dim the stop button */
+.stSpinner > div { animation-duration: 0.4s !important; }        /* snappier spinners */
+/* Prevent the whole app from dimming during reruns */
+.stApp { transition: none !important; }
+[data-testid="stAppViewContainer"] { opacity: 1 !important; }
+/* Soft fade for data widgets so numbers don't "jump" */
+[data-testid="stMetricValue"], [data-testid="stMetricLabel"] {
+    transition: color 0.3s ease, opacity 0.3s ease;
+}
 </style>
 """, unsafe_allow_html=True)
 
@@ -172,8 +187,16 @@ def _get_live_price_with_ws_fallback(token, symbol, option_data):
 
 
 def _poll_runtime_market_data(token, symbol, expiry):
-    """Keep live price fast while refreshing heavy option-chain data less often."""
+    """Keep live price fast while refreshing heavy option-chain data less often.
+
+    Skipped when auto-refresh is enabled (our proper auto-refresh handles it)
+    to avoid duplicate fetches and spinner flashes.
+    """
     if not token or token == "DEMO" or not expiry:
+        return
+    # If the user-controlled auto-refresh is on, let that be the single source
+    # of truth — don't double-fetch from here.
+    if st.session_state.get("auto_refresh"):
         return
 
     now = datetime.now()
@@ -190,7 +213,8 @@ def _poll_runtime_market_data(token, symbol, expiry):
 
     last_chain = st.session_state.get("last_chain_refresh")
     if last_chain is None or (now - last_chain).total_seconds() >= 20:
-        fetch_all_data(token, symbol, expiry, include_news=False, reset_ai=False)
+        fetch_all_data(token, symbol, expiry, include_news=False,
+                       reset_ai=False, silent=True)
         st.session_state.last_chain_refresh = datetime.now()
 
 
@@ -467,12 +491,22 @@ def _render_candlestick_chart(candles: pd.DataFrame, title: str):
 
 
 # ── Full Data Fetch ───────────────────────────────────────────────────────────
-def fetch_all_data(token, symbol, expiry, include_news=False, reset_ai=True):
-    """Fetch all data sources in one call."""
-    with st.spinner("Fetching option chain..."):
+def fetch_all_data(token, symbol, expiry, include_news=False, reset_ai=True, silent=False):
+    """Fetch all data sources in one call.
+
+    silent=True suppresses the st.spinner() UI — used during auto-refresh
+    so the page doesn't grey out every few seconds.
+    """
+    # Context manager helper: real spinner if interactive, no-op if silent
+    import contextlib
+    def _spin(label):
+        return contextlib.nullcontext() if silent else st.spinner(label)
+
+    with _spin("Fetching option chain..."):
         data, err = fetch_option_chain_both(token, symbol, expiry)
     if err:
-        st.error(f"❌ Option chain: {err}")
+        if not silent:
+            st.error(f"❌ Option chain: {err}")
         return False
 
     st.session_state.option_data = data
@@ -483,7 +517,7 @@ def fetch_all_data(token, symbol, expiry, include_news=False, reset_ai=True):
                     "volume","delta","theta","gamma","vega"]:
             df = num(df, col)
 
-    with st.spinner("Fetching live price..."):
+    with _spin("Fetching live price..."):
         live = _get_live_price_with_ws_fallback(token, symbol, data)
     st.session_state.live_price = live
 
@@ -504,7 +538,7 @@ def fetch_all_data(token, symbol, expiry, include_news=False, reset_ai=True):
         live["ltp"] = spot
         live["_derived"] = True
 
-    with st.spinner("Computing indicators..."):
+    with _spin("Computing indicators..."):
         ind = compute_technical_indicators(
             data.get("calls",[]), data.get("puts",[]), spot, symbol)
         br  = compute_market_breadth(
@@ -524,7 +558,7 @@ def fetch_all_data(token, symbol, expiry, include_news=False, reset_ai=True):
 
     should_refresh_news = include_news or not st.session_state.news or _news_is_stale()
     if should_refresh_news:
-        with st.spinner("Fetching news..."):
+        with _spin("Fetching news..."):
             news = fetch_market_news(symbol)
         st.session_state.news = news
         st.session_state.last_news_refresh = datetime.now()
@@ -1071,13 +1105,17 @@ def page_dashboard():
     # ═══════════════════════════════════════════════════════════════════════
     # AUTO-REFRESH TIMERS — must be registered BEFORE any rendering so that
     # the fetch happens early in the rerun and the rendered widgets read the
-    # fresh data. Placing these at the bottom of the function caused a
-    # 1-cycle lag where only live-price (WebSocket) appeared to update.
+    # fresh data.
+    #
+    # IMPORTANT: auto-refresh pauses while AI is generating, so it cannot
+    # interrupt the AI API call or produce a stale "AI key not set" error.
     # ═══════════════════════════════════════════════════════════════════════
+    _ai_in_progress = st.session_state.get("ai_loading", False)
     _auto_refresh_active = (
         st.session_state.get("auto_refresh")
         and st.session_state.get("option_data") is not None
         and st.session_state.get("selected_expiry")
+        and not _ai_in_progress                     # ← pause during AI call
     )
 
     if _auto_refresh_active:
@@ -1089,22 +1127,18 @@ def page_dashboard():
 
         # Tier 1 — 1-second WS tick (only when WS connected). No API call,
         # just triggers a rerun so the render picks up the latest in-memory
-        # WS price dict. The actual price read happens in the "WebSocket
-        # live data override" block further down in the normal render flow.
+        # WS price dict.
         if _feed_live:
             st_autorefresh(interval=1000, key="options_ws_tick_refresh")
 
         # Tier 2 — Full data refresh on the user-configured interval.
-        # This component counts reruns; first render returns 0, every scheduled
-        # rerun after that returns 1, 2, 3...
         _slow_tick = st_autorefresh(
             interval=_slow_interval_s * 1000,
             key="options_full_refresh",
         )
 
-        # Only fetch when we're in a scheduled rerun (tick > 0). Also
-        # guard against duplicate fetches within the same interval window
-        # (a WS 1s tick can race the 5s slow tick).
+        # Only fetch on a scheduled rerun (tick > 0) and guard against
+        # double-fetches if WS ticks race the slow tick.
         if _slow_tick and _slow_tick > 0:
             _last = st.session_state.get("_last_auto_fetch_ts")
             _now_ts = datetime.now()
@@ -1116,7 +1150,8 @@ def page_dashboard():
                         sym,
                         st.session_state.selected_expiry,
                         include_news=_news_is_stale(),
-                        reset_ai=False,  # ← AI recommendation is preserved
+                        reset_ai=False,   # ← preserves AI recommendation
+                        silent=True,      # ← no spinners, no grey-out
                     )
                 except Exception as _e:
                     # Swallow transient errors so the loop keeps running
@@ -1656,90 +1691,107 @@ def page_dashboard():
         profile_label = get_profile(st.session_state.risk_profile)["label"]
         if st.button(f"🧠 Get AI Recommendation ({profile_label})", use_container_width=True,
                      type="primary", key="ai_btn"):
-            # Build context
-            context = build_market_context_with_candles(
-                symbol=sym, expiry=exp, live_price=live,
-                snapshot=snapshot, pcr_data=pcr_data,
-                support=sup, resistance=res,
-                buildup=buildup, smart_money=smart,
-                indicators=ind, breadth=br, sentiment=sent,
-                top_calls=top_calls, top_puts=top_puts,
-                candle_context=candle_summary,
-                breakout_alerts=breakout_alerts,
-                profile_name=st.session_state.risk_profile,
-            )
-
-            # ── Append extra feature data to AI context ──────────────────────
-            _extra = []
+            # Block auto-refresh for the full duration of this click handler.
+            # Also preserve any existing AI result — don't wipe until the new
+            # one is ready, so the UI doesn't "flash empty" if the API errors.
+            st.session_state.ai_loading = True
             try:
-                _v = compute_oi_velocity(df_calls, df_puts, spot)
-                _cs = "; ".join([f"{s['strike']:.0f}CE {s['oi_chg']:+.0f}%" for s in _v.get("call_surges",[])[:3]])
-                _ps = "; ".join([f"{s['strike']:.0f}PE {s['oi_chg']:+.0f}%" for s in _v.get("put_surges",[])[:3]])
-                _extra.append(f"\n━━━ OI CHANGE VELOCITY ━━━\nBias:{_v.get('bias')}\n" + "; ".join(_v.get("signals",[])) + f"\nCALL:{_cs}\nPUT:{_ps}")
-            except Exception:
-                pass
-            try:
-                _ai_a = st.session_state.ai_result.get("action","BUY CALL") if st.session_state.ai_result else "BUY CALL"
-                _t2 = compute_entry_timing_score(live, df_calls, df_puts, candles_5m, sent, _ai_a)
-                _extra.append(f"\n━━━ ENTRY TIMING SCORE ━━━\nScore:{_t2['score']}/100 Grade:{_t2['grade']} Action:{'ENTER NOW' if not _t2['wait'] else 'WAIT'}\n" + " | ".join(_t2["signals"][:4]))
-            except Exception:
-                pass
-            try:
-                from features import fetch_banknifty_spot, compute_divergence
-                _bn = st.session_state.get("banknifty_spot", 0) or fetch_banknifty_spot()
-                if _bn > 0:
-                    st.session_state["banknifty_spot"] = _bn
-                _d = compute_divergence(float(live.get("change_pct", 0) or 0), _bn)
-                if _d.get("available"):
-                    _extra.append(f"\n━━━ BANKNIFTY DIVERGENCE ━━━\n₹{_bn:,.0f} {_d['signal']}\n{_d['description']}")
-            except Exception:
-                pass
-            if st.session_state.get("intelligence_loaded"):
-                try:
-                    from market_intelligence import build_intelligence_summary
-                    _extra.append("\n" + build_intelligence_summary(
-                        st.session_state.get("fii_dii") or {},
-                        st.session_state.get("global_cues") or {"data": {}},
-                        st.session_state.get("india_vix") or {},
-                        st.session_state.get("mkt_breadth") or {},
-                        st.session_state.get("news_items") or [],
-                    ))
-                except Exception:
-                    pass
-            if _extra:
-                context += "\n" + "\n".join(_extra)
-            # Add market context note
-            mkt_note = f"Market Status: {mkt['status']} as of {mkt['current_ist']}."
-            if not mkt['is_open']:
-                mkt_note += f" Data is from last trading session ({mkt['last_trading_day']})."
-            full_note = mkt_note + ("\n" + user_note if user_note else "")
-            with st.spinner("🧠 AI analyzing all market factors... (10-20 seconds)"):
-                result = get_ai_analysis(
-                    context,
-                    full_note,
+                # Build context
+                context = build_market_context_with_candles(
+                    symbol=sym, expiry=exp, live_price=live,
+                    snapshot=snapshot, pcr_data=pcr_data,
+                    support=sup, resistance=res,
+                    buildup=buildup, smart_money=smart,
+                    indicators=ind, breadth=br, sentiment=sent,
+                    top_calls=top_calls, top_puts=top_puts,
+                    candle_context=candle_summary,
+                    breakout_alerts=breakout_alerts,
                     profile_name=st.session_state.risk_profile,
                 )
-            result = normalize_trade_recommendation(
-                result,
-                market_inputs={
-                    "symbol": sym,
-                    "live_price": live,
-                    "snapshot": snapshot,
-                    "pcr_data": pcr_data,
-                    "support": sup,
-                    "resistance": res,
-                    "intraday_levels": intraday_lvls,
-                    "buildup": buildup,
-                    "smart_money": smart,
-                    "indicators": ind,
-                    "sentiment": sent,
-                    "calls_data": data.get("calls", []),
-                    "puts_data": data.get("puts", []),
-                },
-                profile_name=st.session_state.risk_profile,
-            )
-            st.session_state.ai_result = result
-            st.session_state.ai_result_timestamp = datetime.now()
+
+                # ── Append extra feature data to AI context ──────────────────────
+                _extra = []
+                try:
+                    _v = compute_oi_velocity(df_calls, df_puts, spot)
+                    _cs = "; ".join([f"{s['strike']:.0f}CE {s['oi_chg']:+.0f}%" for s in _v.get("call_surges",[])[:3]])
+                    _ps = "; ".join([f"{s['strike']:.0f}PE {s['oi_chg']:+.0f}%" for s in _v.get("put_surges",[])[:3]])
+                    _extra.append(f"\n━━━ OI CHANGE VELOCITY ━━━\nBias:{_v.get('bias')}\n" + "; ".join(_v.get("signals",[])) + f"\nCALL:{_cs}\nPUT:{_ps}")
+                except Exception:
+                    pass
+                try:
+                    _ai_a = st.session_state.ai_result.get("action","BUY CALL") if st.session_state.ai_result else "BUY CALL"
+                    _t2 = compute_entry_timing_score(live, df_calls, df_puts, candles_5m, sent, _ai_a)
+                    _extra.append(f"\n━━━ ENTRY TIMING SCORE ━━━\nScore:{_t2['score']}/100 Grade:{_t2['grade']} Action:{'ENTER NOW' if not _t2['wait'] else 'WAIT'}\n" + " | ".join(_t2["signals"][:4]))
+                except Exception:
+                    pass
+                try:
+                    from features import fetch_banknifty_spot, compute_divergence
+                    _bn = st.session_state.get("banknifty_spot", 0) or fetch_banknifty_spot()
+                    if _bn > 0:
+                        st.session_state["banknifty_spot"] = _bn
+                    _d = compute_divergence(float(live.get("change_pct", 0) or 0), _bn)
+                    if _d.get("available"):
+                        _extra.append(f"\n━━━ BANKNIFTY DIVERGENCE ━━━\n₹{_bn:,.0f} {_d['signal']}\n{_d['description']}")
+                except Exception:
+                    pass
+                if st.session_state.get("intelligence_loaded"):
+                    try:
+                        from market_intelligence import build_intelligence_summary
+                        _extra.append("\n" + build_intelligence_summary(
+                            st.session_state.get("fii_dii") or {},
+                            st.session_state.get("global_cues") or {"data": {}},
+                            st.session_state.get("india_vix") or {},
+                            st.session_state.get("mkt_breadth") or {},
+                            st.session_state.get("news_items") or [],
+                        ))
+                    except Exception:
+                        pass
+                if _extra:
+                    context += "\n" + "\n".join(_extra)
+                # Add market context note
+                mkt_note = f"Market Status: {mkt['status']} as of {mkt['current_ist']}."
+                if not mkt['is_open']:
+                    mkt_note += f" Data is from last trading session ({mkt['last_trading_day']})."
+                full_note = mkt_note + ("\n" + user_note if user_note else "")
+                with st.spinner("🧠 AI analyzing all market factors... (10-20 seconds)"):
+                    result = get_ai_analysis(
+                        context,
+                        full_note,
+                        profile_name=st.session_state.risk_profile,
+                    )
+                result = normalize_trade_recommendation(
+                    result,
+                    market_inputs={
+                        "symbol": sym,
+                        "live_price": live,
+                        "snapshot": snapshot,
+                        "pcr_data": pcr_data,
+                        "support": sup,
+                        "resistance": res,
+                        "intraday_levels": intraday_lvls,
+                        "buildup": buildup,
+                        "smart_money": smart,
+                        "indicators": ind,
+                        "sentiment": sent,
+                        "calls_data": data.get("calls", []),
+                        "puts_data": data.get("puts", []),
+                    },
+                    profile_name=st.session_state.risk_profile,
+                )
+                # Only replace the existing ai_result if the new one looks
+                # valid — this prevents a transient "AI key not set" error
+                # from wiping a working pinned recommendation.
+                if isinstance(result, dict) and "error" not in result:
+                    st.session_state.ai_result = result
+                    st.session_state.ai_result_timestamp = datetime.now()
+                elif isinstance(result, dict) and "error" in result:
+                    # Show the error once, but keep the pinned result
+                    st.error(f"❌ AI Error: {result.get('error', 'Unknown')}. "
+                             f"Previous recommendation kept.")
+            except Exception as _ai_e:
+                st.error(f"❌ AI call failed: {_ai_e}. Previous recommendation kept.")
+            finally:
+                st.session_state.ai_loading = False
             st.rerun()
 
     # ── AI Result Display ─────────────────────────────────────────────────
