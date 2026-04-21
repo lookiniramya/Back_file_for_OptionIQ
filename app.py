@@ -5,6 +5,7 @@ Sections: Live Price | Market Internals | Option Chain | OI Analysis |
 """
 
 import streamlit as st
+from streamlit_autorefresh import st_autorefresh
 import os as _os
 try:
     if not _os.path.exists(".streamlit/config.toml"):
@@ -90,8 +91,9 @@ def init_state():
         "last_refresh": None,
         "last_live_poll": None,
         "last_chain_refresh": None,
-        "auto_refresh": False, "refresh_interval": 60,
+        "auto_refresh": False, "refresh_interval": 5,
         "ai_result": None, "ai_loading": False,
+        "ai_result_timestamp": None,
         "market_status": None,
         "anthropic_api_key": "",
         "ws_enabled": False,
@@ -529,6 +531,7 @@ def fetch_all_data(token, symbol, expiry, include_news=False, reset_ai=True):
     st.session_state.last_refresh = datetime.now()
     if reset_ai:
         st.session_state.ai_result = None
+        st.session_state.ai_result_timestamp = None
     return True
 
 
@@ -549,7 +552,7 @@ def render_sidebar():
                 for k in ["authenticated","access_token","read_access_token","public_access_token","token_response","api_key","api_secret",
                            "request_token","option_data","expiry_dates",
                            "live_price","indicators","breadth","sentiment",
-                           "news","ai_result"]:
+                           "news","ai_result","ai_result_timestamp"]:
                     st.session_state[k] = False if k=="authenticated" else ([] if k=="expiry_dates" else None if k not in ["api_key","api_secret","access_token","request_token","read_access_token","public_access_token"] else "")
                 st.session_state.step = "credentials"
                 st.query_params.clear()
@@ -586,6 +589,7 @@ def render_sidebar():
             if new_profile != st.session_state.risk_profile:
                 st.session_state.risk_profile = new_profile
                 st.session_state.ai_result = None  # reset AI result on profile change
+                st.session_state.ai_result_timestamp = None
 
             # Show profile details
             from ai_engine import get_profile
@@ -657,8 +661,9 @@ def render_sidebar():
             st.session_state.auto_refresh = auto
             if auto:
                 iv = st.slider("Interval (sec)", 2, 300,
-                               st.session_state.refresh_interval, 30)
+                               st.session_state.refresh_interval, 1)
                 st.session_state.refresh_interval = iv
+                st.caption(f"⚡ Refreshing every {iv}s")
 
             st.divider()
             with st.expander("🔧 API Diagnostics"):
@@ -1075,6 +1080,28 @@ def page_dashboard():
     mkt = get_market_status()
     st.session_state.market_status = mkt
     st.markdown(market_status_banner(mkt), unsafe_allow_html=True)
+
+    # ── Auto-start WebSocket if token is available and market is open ──────
+    # This saves the user a manual click. Only runs once per session — if the
+    # WS disconnects mid-session, the user can restart from the sidebar.
+    if (
+        mkt.get("is_open")
+        and st.session_state.get("public_access_token")
+        and not st.session_state.get("ws_enabled")
+        and not st.session_state.get("ws_auto_start_tried")
+    ):
+        try:
+            _feed = get_feed()
+            if _feed.start(
+                st.session_state.public_access_token,
+                st.session_state.selected_symbol,
+            ):
+                st.session_state.ws_enabled = True
+                st.session_state.ws_symbol = st.session_state.selected_symbol
+        except Exception:
+            pass
+        # Mark as tried so we don't loop on failure
+        st.session_state.ws_auto_start_tried = True
     # ── Data freshness strip
     _lv = st.session_state.get("live_price") or {}
     _src, _ltp = _lv.get("source","?"), float(_lv.get("ltp",0) or 0)
@@ -1657,6 +1684,7 @@ def page_dashboard():
                 profile_name=st.session_state.risk_profile,
             )
             st.session_state.ai_result = result
+            st.session_state.ai_result_timestamp = datetime.now()
             st.rerun()
 
     # ── AI Result Display ─────────────────────────────────────────────────
@@ -1667,21 +1695,61 @@ def page_dashboard():
     if mkt.get("is_open"):
         st.caption("🔴 Live · Auto-refreshes every interval | Click 🔄 Refresh All for instant update")
 
-    # ── Auto Refresh ──────────────────────────────────────────────────────
-    if st.session_state.auto_refresh and st.session_state.last_refresh:
-        elapsed = (datetime.now() - st.session_state.last_refresh).seconds
-        remaining = st.session_state.refresh_interval - elapsed
-        if remaining <= 0:
-            fetch_all_data(
-                st.session_state.access_token,
-                sym,
-                st.session_state.selected_expiry,
-                include_news=_news_is_stale(),
-                reset_ai=False,
+    # ═══════════════════════════════════════════════════════════════════════
+    # AUTO REFRESH — Two-tier design
+    # ═══════════════════════════════════════════════════════════════════════
+    # Tier 1 (FAST, 1s): WebSocket-only price tick. Reads in-memory dict from
+    #                    the background WS thread. Zero API calls. Only active
+    #                    when WebSocket is connected.
+    # Tier 2 (SLOW, user-controlled, default 5s): Full option chain + indicators
+    #                    refresh. Includes REST fallback for live price if WS
+    #                    is not connected.
+    #
+    # Both tiers pass reset_ai=False so the AI recommendation is preserved
+    # across every tick. The AI result can only be cleared by: explicit user
+    # action (profile change, new AI run, logout) or manual "Refresh All".
+    # ═══════════════════════════════════════════════════════════════════════
+
+    if st.session_state.auto_refresh:
+        slow_interval_s = max(2, int(st.session_state.refresh_interval))
+        ws_live = (
+            st.session_state.get("ws_enabled")
+            and get_feed().is_connected
+        )
+
+        # Tier 1: Fast WS-only tick (1s) — only when WS is active and market open
+        if ws_live and mkt.get("is_open"):
+            st_autorefresh(
+                interval=1000,  # 1 second
+                key="options_ws_tick_refresh",
             )
-            st.rerun()
-        else:
-            st.caption(f"⏳ Auto-refresh in {remaining}s | Click 🔄 Refresh All for instant update")
+
+        # Tier 2: Full refresh on the user-configured interval
+        slow_tick = st_autorefresh(
+            interval=slow_interval_s * 1000,
+            key="options_full_refresh",
+        )
+        # slow_tick == 0 on the first render after enabling auto-refresh;
+        # skip it to avoid double-fetching (current render already has fresh data).
+        if slow_tick and slow_tick > 0:
+            try:
+                fetch_all_data(
+                    st.session_state.access_token,
+                    sym,
+                    st.session_state.selected_expiry,
+                    include_news=_news_is_stale(),
+                    reset_ai=False,  # ← preserves AI recommendation
+                )
+            except Exception as _e:
+                # Never let a transient API error break the refresh loop
+                st.caption(f"⚠️ Refresh skipped this cycle: {_e}")
+
+        # Status strip
+        ws_status = "🟢 WS live (1s ticks)" if ws_live else "🟡 REST only"
+        st.caption(
+            f"⚡ Auto-refresh ON · {ws_status} · full data every {slow_interval_s}s "
+            f"| AI recommendation is preserved across refreshes"
+        )
 
 
 def _render_compact_chain(df_calls, df_puts, atm, spot):
@@ -1789,10 +1857,30 @@ def _render_ai_result(result: dict, symbol: str, atm: float):
     mkt_now = st.session_state.get("market_status", {})
     if mkt_now and not mkt_now.get("is_open", True) and action != "NO TRADE":
         st.markdown(f"""<div style="background:#fff8e1;border:1px solid #ffe082;border-left:4px solid #f57f17;border-radius:8px;padding:10px 16px;margin-bottom:12px;display:flex;align-items:center;gap:10px"><span style="font-size:1.2rem">🌙</span><div><div style="font-weight:700;color:#7f5a00">PRE-MARKET PLAN — For Next Trading Session</div><div style="font-size:.82rem;color:#9e6c00">Market is closed. Verify all cues at 9:15 AM open. Do NOT use today's expiry strikes.</div></div></div>""", unsafe_allow_html=True)
+
+    # AI generation timestamp + age (pinned indicator so users know the
+    # recommendation survives auto-refresh).
+    ai_ts = st.session_state.get("ai_result_timestamp")
+    if ai_ts:
+        age_s = int((datetime.now() - ai_ts).total_seconds())
+        if age_s < 60:
+            age_str = f"{age_s}s ago"
+        elif age_s < 3600:
+            age_str = f"{age_s // 60}m {age_s % 60}s ago"
+        else:
+            age_str = f"{age_s // 3600}h {(age_s % 3600) // 60}m ago"
+        ts_str = ai_ts.strftime("%H:%M:%S")
+    else:
+        age_str = "just now"
+        ts_str = datetime.now().strftime("%H:%M:%S")
+
     st.markdown(
-        f"### 🤖 AI Recommendation — {datetime.now().strftime('%H:%M:%S')} &nbsp;"
+        f"### 🤖 AI Recommendation "
+        f'<span style="font-size:0.75rem;background:#e8f5e9;border:1px solid #81c784;'
+        f'border-radius:6px;padding:2px 8px;color:#2e7d32;margin-left:6px">📌 Pinned</span>'
+        f'<span style="font-size:0.75rem;color:#546e7a;margin-left:8px">generated {ts_str} · {age_str}</span>'
         f'<span style="font-size:0.8rem;background:#ffffff;border:1px solid {p_color};'
-        f'border-radius:6px;padding:3px 10px;color:{p_color}">{p["label"]} Profile</span>',
+        f'border-radius:6px;padding:3px 10px;color:{p_color};margin-left:8px">{p["label"]} Profile</span>',
         unsafe_allow_html=True
     )
 
