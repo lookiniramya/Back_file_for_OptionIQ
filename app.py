@@ -94,6 +94,7 @@ def init_state():
         "auto_refresh": False, "refresh_interval": 5,
         "ai_result": None, "ai_loading": False,
         "ai_result_timestamp": None,
+        "_last_auto_fetch_ts": None,
         "market_status": None,
         "anthropic_api_key": "",
         "ws_enabled": False,
@@ -1067,12 +1068,66 @@ def page_dashboard():
     exp  = st.session_state.selected_expiry or "—"
     ts   = st.session_state.last_refresh
 
+    # ═══════════════════════════════════════════════════════════════════════
+    # AUTO-REFRESH TIMERS — must be registered BEFORE any rendering so that
+    # the fetch happens early in the rerun and the rendered widgets read the
+    # fresh data. Placing these at the bottom of the function caused a
+    # 1-cycle lag where only live-price (WebSocket) appeared to update.
+    # ═══════════════════════════════════════════════════════════════════════
+    _auto_refresh_active = (
+        st.session_state.get("auto_refresh")
+        and st.session_state.get("option_data") is not None
+        and st.session_state.get("selected_expiry")
+    )
+
+    if _auto_refresh_active:
+        _slow_interval_s = max(2, int(st.session_state.refresh_interval))
+        _feed_live = (
+            st.session_state.get("ws_enabled")
+            and get_feed().is_connected
+        )
+
+        # Tier 1 — 1-second WS tick (only when WS connected). No API call,
+        # just triggers a rerun so the render picks up the latest in-memory
+        # WS price dict. The actual price read happens in the "WebSocket
+        # live data override" block further down in the normal render flow.
+        if _feed_live:
+            st_autorefresh(interval=1000, key="options_ws_tick_refresh")
+
+        # Tier 2 — Full data refresh on the user-configured interval.
+        # This component counts reruns; first render returns 0, every scheduled
+        # rerun after that returns 1, 2, 3...
+        _slow_tick = st_autorefresh(
+            interval=_slow_interval_s * 1000,
+            key="options_full_refresh",
+        )
+
+        # Only fetch when we're in a scheduled rerun (tick > 0). Also
+        # guard against duplicate fetches within the same interval window
+        # (a WS 1s tick can race the 5s slow tick).
+        if _slow_tick and _slow_tick > 0:
+            _last = st.session_state.get("_last_auto_fetch_ts")
+            _now_ts = datetime.now()
+            if _last is None or (_now_ts - _last).total_seconds() >= (_slow_interval_s - 0.5):
+                st.session_state._last_auto_fetch_ts = _now_ts
+                try:
+                    fetch_all_data(
+                        st.session_state.access_token,
+                        sym,
+                        st.session_state.selected_expiry,
+                        include_news=_news_is_stale(),
+                        reset_ai=False,  # ← AI recommendation is preserved
+                    )
+                except Exception as _e:
+                    # Swallow transient errors so the loop keeps running
+                    st.toast(f"⚠️ Refresh skipped: {_e}", icon="⚠️")
+
     st.markdown(f"""
     <div class="main-header">
         <h1>📊 OptionsIQ — {sym}</h1>
         <p class="header-sub">
             Expiry: <strong>{exp}</strong> &nbsp;|&nbsp;
-            {'Last updated: <strong>' + ts.strftime('%H:%M:%S') + '</strong>' if ts else 'No data loaded yet'}
+            {'Last updated: <strong>' + (st.session_state.last_refresh.strftime('%H:%M:%S') if st.session_state.last_refresh else '—') + '</strong>' if st.session_state.last_refresh else 'No data loaded yet'}
         </p>
     </div>""", unsafe_allow_html=True)
 
@@ -1695,59 +1750,18 @@ def page_dashboard():
     if mkt.get("is_open"):
         st.caption("🔴 Live · Auto-refreshes every interval | Click 🔄 Refresh All for instant update")
 
-    # ═══════════════════════════════════════════════════════════════════════
-    # AUTO REFRESH — Two-tier design
-    # ═══════════════════════════════════════════════════════════════════════
-    # Tier 1 (FAST, 1s): WebSocket-only price tick. Reads in-memory dict from
-    #                    the background WS thread. Zero API calls. Only active
-    #                    when WebSocket is connected.
-    # Tier 2 (SLOW, user-controlled, default 5s): Full option chain + indicators
-    #                    refresh. Includes REST fallback for live price if WS
-    #                    is not connected.
-    #
-    # Both tiers pass reset_ai=False so the AI recommendation is preserved
-    # across every tick. The AI result can only be cleared by: explicit user
-    # action (profile change, new AI run, logout) or manual "Refresh All".
-    # ═══════════════════════════════════════════════════════════════════════
-
+    # ── Auto-refresh status strip (timers are registered at top of function) ──
     if st.session_state.auto_refresh:
         slow_interval_s = max(2, int(st.session_state.refresh_interval))
-        ws_live = (
-            st.session_state.get("ws_enabled")
-            and get_feed().is_connected
-        )
-
-        # Tier 1: Fast WS-only tick (1s) — only when WS is active and market open
-        if ws_live and mkt.get("is_open"):
-            st_autorefresh(
-                interval=1000,  # 1 second
-                key="options_ws_tick_refresh",
-            )
-
-        # Tier 2: Full refresh on the user-configured interval
-        slow_tick = st_autorefresh(
-            interval=slow_interval_s * 1000,
-            key="options_full_refresh",
-        )
-        # slow_tick == 0 on the first render after enabling auto-refresh;
-        # skip it to avoid double-fetching (current render already has fresh data).
-        if slow_tick and slow_tick > 0:
-            try:
-                fetch_all_data(
-                    st.session_state.access_token,
-                    sym,
-                    st.session_state.selected_expiry,
-                    include_news=_news_is_stale(),
-                    reset_ai=False,  # ← preserves AI recommendation
-                )
-            except Exception as _e:
-                # Never let a transient API error break the refresh loop
-                st.caption(f"⚠️ Refresh skipped this cycle: {_e}")
-
-        # Status strip
-        ws_status = "🟢 WS live (1s ticks)" if ws_live else "🟡 REST only"
+        ws_live = st.session_state.get("ws_enabled") and get_feed().is_connected
+        ws_status = "🟢 WS live (1s price ticks)" if ws_live else "🟡 REST only"
+        last_fetch = st.session_state.get("_last_auto_fetch_ts")
+        age_str = ""
+        if last_fetch:
+            _age = int((datetime.now() - last_fetch).total_seconds())
+            age_str = f" · last full refresh {_age}s ago"
         st.caption(
-            f"⚡ Auto-refresh ON · {ws_status} · full data every {slow_interval_s}s "
+            f"⚡ Auto-refresh ON · {ws_status} · full data every {slow_interval_s}s{age_str} "
             f"| AI recommendation is preserved across refreshes"
         )
 
