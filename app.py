@@ -110,6 +110,8 @@ def init_state():
         "ai_result": None, "ai_loading": False,
         "ai_result_timestamp": None,
         "_last_auto_fetch_ts": None,
+        "_refresh_paused": False,
+        "_ai_click_pending": False,
         "market_status": None,
         "anthropic_api_key": "",
         "ws_enabled": False,
@@ -1111,11 +1113,13 @@ def page_dashboard():
     # interrupt the AI API call or produce a stale "AI key not set" error.
     # ═══════════════════════════════════════════════════════════════════════
     _ai_in_progress = st.session_state.get("ai_loading", False)
+    _user_paused = st.session_state.get("_refresh_paused", False)
     _auto_refresh_active = (
         st.session_state.get("auto_refresh")
         and st.session_state.get("option_data") is not None
         and st.session_state.get("selected_expiry")
         and not _ai_in_progress                     # ← pause during AI call
+        and not _user_paused                        # ← user-controlled pause
     )
 
     if _auto_refresh_active:
@@ -1689,12 +1693,53 @@ def page_dashboard():
     col_btn1, col_btn2, col_btn3 = st.columns([1, 2, 1])
     with col_btn2:
         profile_label = get_profile(st.session_state.risk_profile)["label"]
-        if st.button(f"🧠 Get AI Recommendation ({profile_label})", use_container_width=True,
-                     type="primary", key="ai_btn"):
-            # Block auto-refresh for the full duration of this click handler.
-            # Also preserve any existing AI result — don't wipe until the new
-            # one is ready, so the UI doesn't "flash empty" if the API errors.
+
+        # ── Pause Refresh toggle right above the AI button ─────────────────
+        # Gives the user a reliable way to stop auto-refresh so they can
+        # comfortably click the AI button without widgets being disabled
+        # mid-rerun.
+        _paused = st.session_state.get("_refresh_paused", False)
+        pause_cols = st.columns([1, 1])
+        with pause_cols[0]:
+            if not _paused and st.session_state.get("auto_refresh"):
+                if st.button("⏸ Pause Refresh", use_container_width=True,
+                             key="pause_refresh_btn",
+                             help="Temporarily pause auto-refresh so you can click AI without interruption"):
+                    st.session_state._refresh_paused = True
+                    st.rerun()
+            elif _paused:
+                if st.button("▶ Resume Refresh", use_container_width=True,
+                             key="resume_refresh_btn", type="secondary"):
+                    st.session_state._refresh_paused = False
+                    st.rerun()
+        with pause_cols[1]:
+            if _paused:
+                st.caption("⏸️ **Auto-refresh paused** — click AI safely now")
+            elif st.session_state.get("auto_refresh"):
+                st.caption(f"🔄 Refreshing every {st.session_state.refresh_interval}s")
+
+        # Callback fires BEFORE the rerun — this guarantees ai_loading is set
+        # in session state before the next auto-refresh tick can read it.
+        def _on_ai_click():
             st.session_state.ai_loading = True
+            st.session_state._ai_click_pending = True  # processed this rerun
+            st.session_state._refresh_paused = True    # belt-and-suspenders
+
+        # Disable the button while AI is already running — prevents double-clicks
+        _ai_running = st.session_state.get("ai_loading", False)
+
+        st.button(
+            f"🧠 Get AI Recommendation ({profile_label})"
+            if not _ai_running else "🧠 AI is analyzing... please wait",
+            use_container_width=True,
+            type="primary",
+            key="ai_btn",
+            on_click=_on_ai_click,
+            disabled=_ai_running,
+        )
+
+        if st.session_state.get("_ai_click_pending"):
+            st.session_state._ai_click_pending = False  # consume the flag
             try:
                 # Build context
                 context = build_market_context_with_candles(
@@ -1792,6 +1837,10 @@ def page_dashboard():
                 st.error(f"❌ AI call failed: {_ai_e}. Previous recommendation kept.")
             finally:
                 st.session_state.ai_loading = False
+                # Auto-resume refresh if it was paused by the AI click flow.
+                # (If the user manually clicked "Pause Refresh" before the AI
+                # click, they can re-enable it with "Resume Refresh".)
+                st.session_state._refresh_paused = False
             st.rerun()
 
     # ── AI Result Display ─────────────────────────────────────────────────
