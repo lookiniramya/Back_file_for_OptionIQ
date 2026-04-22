@@ -24,7 +24,9 @@ RISK_PROFILES = {
         "avoid_strikes":     ["OTM-1", "OTM-2", "OTM-3"],
         "max_lots":          1,
         "sl_pct":            25,      # SL at 25% loss of premium
-        "target_pct":        50,      # Target at 50% gain
+        "target1_pct":       25,      # T1: quick realistic target (15-30 min)
+        "target2_pct":       50,      # T2: stretch target if momentum continues
+        "target_pct":        50,      # Legacy field — kept for backward compat
         "max_capital_pct":   1.5,     # Max 1.5% capital per trade
         "avoid_expiry":      True,
         "avoid_open_mins":   45,      # Avoid first 45 min
@@ -36,6 +38,7 @@ RISK_PROFILES = {
             "Prefer ITM options — higher delta, less theta decay risk",
             "Exit immediately if market moves against by 25%",
             "Never hold options overnight",
+            "Book 75% at T1, trail SL to breakeven, let 25% run to T2",
             "Stick to liquid ATM/ITM strikes with tight spreads",
         ],
     },
@@ -50,7 +53,9 @@ RISK_PROFILES = {
         "avoid_strikes":     ["OTM-2", "OTM-3", "OTM-4"],
         "max_lots":          2,
         "sl_pct":            35,      # SL at 35% loss of premium
-        "target_pct":        60,      # Target at 60% gain
+        "target1_pct":       30,      # T1: quick realistic target (15-30 min)
+        "target2_pct":       60,      # T2: stretch target
+        "target_pct":        60,      # Legacy field
         "max_capital_pct":   2.5,     # Max 2.5% capital per trade
         "avoid_expiry":      True,
         "avoid_open_mins":   30,      # Avoid first 30 min
@@ -60,9 +65,9 @@ RISK_PROFILES = {
         "notes": [
             "2 signals minimum before entry",
             "Prefer ATM for better delta, OTM-1 for cheaper premium",
-            "Trail SL once 50% profit — protect gains",
+            "Book 50% at T1, trail SL to entry, let 50% run to T2",
             "Max 2 lots — no over-leveraging",
-            "Book 50% at target, trail rest",
+            "If T2 not hit by 75% of timeframe, book everything at market",
         ],
     },
 
@@ -76,7 +81,9 @@ RISK_PROFILES = {
         "avoid_strikes":     ["OTM-4", "OTM-5"],
         "max_lots":          3,
         "sl_pct":            50,      # SL at 50% loss of premium
-        "target_pct":        100,     # Target at 100% gain (double)
+        "target1_pct":       50,      # T1: first realistic target
+        "target2_pct":       100,     # T2: stretch target (double)
+        "target_pct":        100,     # Legacy field
         "max_capital_pct":   4.0,     # Max 4% capital per trade
         "avoid_expiry":      False,   # Can trade on expiry
         "avoid_open_mins":   15,      # Only avoid first 15 min
@@ -86,6 +93,7 @@ RISK_PROFILES = {
         "notes": [
             "Can take OTM-2 for momentum plays",
             "Wider SL to avoid premature exit",
+            "Book 40% at T1, trail SL to entry, let 60% run to T2",
             "Can hold 2-3 days for positional trades",
             "Expiry day trades allowed with strong momentum",
             "Max 3 lots — still manage total risk",
@@ -135,10 +143,27 @@ HARD RULES — NEVER VIOLATE:
 📉 IV limit:               Avoid if ATM IV implied > {p['iv_max']}% (premiums too expensive)
 ⚖️  PCR neutral zone:       {pcr_lo}–{pcr_hi} → do not reject a trade only because PCR is neutral; use other signals
 
-STOP LOSS & TARGET RULES:
+STOP LOSS & TARGET RULES (TWO-TIER TARGET SYSTEM):
 • Stop Loss:  {p['sl_pct']}% below entry premium  (e.g. entry ₹100 → SL ₹{100 - p['sl_pct']})
-• Target:     {p['target_pct']}% above entry premium (e.g. entry ₹100 → Target ₹{100 + p['target_pct']})
+• Target 1 (T1):  {p['target1_pct']}% above entry — realistic FIRST TARGET, achievable in ~40-60% of timeframe (e.g. entry ₹100 → T1 ₹{100 + p['target1_pct']})
+• Target 2 (T2):  {p['target2_pct']}% above entry — STRETCH target if momentum continues (e.g. entry ₹100 → T2 ₹{100 + p['target2_pct']})
 • Holding:    {p['holding']}
+
+TARGET MANAGEMENT PHILOSOPHY:
+• T1 MUST be genuinely reachable in 15-30 minutes given current volatility
+• T2 is the "home run" — only hit when momentum persists cleanly
+• If spot is deep in a range with no catalyst, keep T1 modest ({p['target1_pct']-10}-{p['target1_pct']}%)
+• If momentum is clear (strong bias, high confidence), T2 can be aggressive
+• Position management: Book majority at T1 → trail SL to breakeven → let rest run to T2
+• NEVER set T1 requiring >80 pts index move in 30 min on a quiet day
+• NEVER set T2 requiring >200 pts index move in 60 min unless VIX > 16
+
+REALISTIC TARGET CALIBRATION:
+• ATM delta ~0.50 → 50 pts index move = ~₹25 option move (25% of ₹100 premium)
+• OTM-1 delta ~0.35 → 50 pts index move = ~₹17.50 option move (17% of ₹100 premium)
+• ITM-1 delta ~0.65 → 50 pts index move = ~₹32.50 option move (32% of ₹100 premium)
+• Use current spot volatility + candle range to calibrate realistic index move
+• State expected index move AND derived option move for EACH target
 
 PROFILE-SPECIFIC NOTES:
 {notes_str}
@@ -202,13 +227,20 @@ RESPOND ONLY WITH THIS EXACT JSON — no text before or after:
   "entry_strike": <integer, nearest 50 to current spot>,
   "entry_type": "ITM-1" | "ATM" | "OTM-1" | "OTM-2",
   "entry_price_range": "<low>-<high in option LTP>",
-  "target_price": <option LTP target achievable in timeframe>,
+  "target1_price": <FIRST target option LTP — realistic, book 50-75% here>,
+  "target1_time": "<estimated time to T1, e.g. '15 min' or '20-30 min'>",
+  "target1_index_move": "<e.g. '30-40 pts up in 20 min'>",
+  "target2_price": <SECOND/stretch target option LTP — momentum scenario>,
+  "target2_time": "<estimated time to T2, e.g. '45 min' or '60 min'>",
+  "target2_index_move": "<e.g. '60-80 pts up in 60 min'>",
+  "target_price": <same value as target1_price — for legacy compatibility>,
   "stop_loss_price": <option LTP SL = {p['sl_pct']}% below entry>,
-  "expected_index_move": "<e.g. 50-80 pts move expected in 30 min>",
-  "risk_reward": "1:X",
+  "expected_index_move": "<overall expected move, e.g. 50-80 pts move in 30-60 min>",
+  "risk_reward": "1:X based on T2",
   "max_lots": <integer 1-{p['max_lots']}>,
   "approx_margin": "<e.g. ₹6500 for 1 lot at ₹100 × 65 lot size>",
   "holding_period": "15 min" | "30 min" | "60 min",
+  "position_management": "<exact plan: Book X% at T1 ₹Y, trail SL to ₹Z, exit rest at T2 ₹W or time-stop>",
   "primary_reason": "<single most important reason in 1 sentence>",
   "supporting_factors": ["<factor 1>", "<factor 2>", "<factor 3>"],
   "key_risks": ["<risk 1>", "<risk 2>"],
@@ -216,7 +248,7 @@ RESPOND ONLY WITH THIS EXACT JSON — no text before or after:
   "market_structure": "TRENDING UP" | "TRENDING DOWN" | "RANGE BOUND" | "BREAKOUT LIKELY",
   "bias_strength": "STRONG" | "MODERATE" | "WEAK",
   "sentiment_summary": "<2-3 sentence market read focusing on next 60 min>",
-  "trade_plan": "<entry at ₹X → SL at ₹Y → target ₹Z → exit by HH:MM plan. If pre-market: state session open plan>",
+  "trade_plan": "<entry at ₹X → SL at ₹Y → T1 at ₹Z1 (book 50-75%) → trail SL to entry → T2 at ₹Z2 → exit by HH:MM>",
   "data_quality_note": "<single sentence: data source quality and confidence impact>",
   "key_factors_used": ["<list 5-6 most decisive factors with values, e.g. PCR 1.35 bullish, OI velocity FRESH PUT WRITING bullish>"]
 }}"""
@@ -258,7 +290,8 @@ Min Confidence:        {p['min_confidence']}/100
 Min Risk-Reward:       1:{p['min_rr']}
 Max Lots:              {p['max_lots']}
 SL Rule:               {p['sl_pct']}% below entry premium
-Target Rule:           {p['target_pct']}% above entry premium
+Target T1 Rule:        {p['target1_pct']}% above entry (realistic — book 50-75% here)
+Target T2 Rule:        {p['target2_pct']}% above entry (stretch — if momentum continues)
 Max Capital Per Trade: {p['max_capital_pct']}%
 
 ━━━ 1. LIVE PRICE DATA ━━━
@@ -629,8 +662,11 @@ def build_fallback_trade_setup(
     low_entry = max(0.5, round(entry_ltp * 0.98, 1))
     high_entry = max(low_entry, round(entry_ltp * 1.02, 1))
     stop_loss = round(entry_ltp * (1 - p["sl_pct"] / 100), 1)
-    target = round(entry_ltp * (1 + p["target_pct"] / 100), 1)
-    rr_value = round((target - entry_ltp) / max(entry_ltp - stop_loss, 0.1), 2)
+    target1 = round(entry_ltp * (1 + p["target1_pct"] / 100), 1)
+    target2 = round(entry_ltp * (1 + p["target2_pct"] / 100), 1)
+    # Risk-reward based on T2 (max potential); T1 R:R is shown separately
+    rr_value = round((target2 - entry_ltp) / max(entry_ltp - stop_loss, 0.1), 2)
+    rr_t1_value = round((target1 - entry_ltp) / max(entry_ltp - stop_loss, 0.1), 2)
     max_lots = 1 if confidence < 65 else min(p["max_lots"], 2 if profile_name.upper() != "AGGRESSIVE" else p["max_lots"])
     approx_margin = int(round(entry_ltp * lot_size * max_lots))
 
@@ -675,13 +711,24 @@ def build_fallback_trade_setup(
         "entry_strike": entry_strike,
         "entry_type": entry_type,
         "entry_price_range": f"{low_entry:.1f}-{high_entry:.1f}",
-        "target_price": target,
+        "target1_price": target1,
+        "target1_time": "15-25 min",
+        "target1_index_move": f"20-35 pts {direction_label} in ~20 min",
+        "target2_price": target2,
+        "target2_time": holding_period,
+        "target2_index_move": f"{expected_move} {direction_label} move in {holding_period.lower()}",
+        "target_price": target1,  # Backward compat — main target field = T1
         "stop_loss_price": stop_loss,
         "expected_index_move": f"{expected_move} {direction_label} move expected in {holding_period.lower()}",
         "risk_reward": f"1:{rr_value:.2f}",
+        "risk_reward_t1": f"1:{rr_t1_value:.2f}",
         "max_lots": max_lots,
         "approx_margin": f"₹{approx_margin:,}",
         "holding_period": holding_period,
+        "position_management": (
+            f"Book 50-75% at T1 ₹{target1:.1f} → trail SL to entry ₹{entry_ltp:.1f} → "
+            f"let rest run to T2 ₹{target2:.1f} → hard exit by end of {holding_period.lower()}"
+        ),
         "primary_reason": factors[0] if factors else "Directional edge is limited but still favors this side over the alternative.",
         "supporting_factors": factors[:3] if factors else ["Market structure slightly favors this direction."],
         "key_risks": risks[:3] if risks else ["Momentum could fade quickly in a range-bound tape."],
@@ -689,7 +736,11 @@ def build_fallback_trade_setup(
         "market_structure": structure,
         "bias_strength": bias_strength,
         "sentiment_summary": summary,
-        "trade_plan": f"Entry around ₹{low_entry:.1f}-₹{high_entry:.1f} -> SL ₹{stop_loss:.1f} -> target ₹{target:.1f} -> exit within {holding_period.lower()} if momentum stalls.",
+        "trade_plan": (
+            f"Entry ₹{low_entry:.1f}-₹{high_entry:.1f} → SL ₹{stop_loss:.1f} → "
+            f"T1 ₹{target1:.1f} (book 50-75%) → trail SL to entry → "
+            f"T2 ₹{target2:.1f} → exit within {holding_period.lower()} if momentum stalls."
+        ),
         "analysis_source": "LOCAL_FALLBACK",
     }
 
@@ -707,6 +758,69 @@ def normalize_trade_recommendation(
     ai_result.setdefault("analysis_source", "ANTHROPIC")
     ai_result.setdefault("estimated_win_rate", max(45, min(80, confidence - 2)))
     ai_result["risk_profile"] = profile_name.upper()
+
+    # ── Backfill two-tier target fields ────────────────────────────────────
+    # If the AI didn't return T1/T2 (older prompt version or it forgot a field),
+    # derive them from the profile's target percentages and the entry premium.
+    p = get_profile(profile_name)
+
+    def _num(val, default=0.0):
+        try:    return float(str(val).replace("₹","").replace(",","").strip())
+        except: return default
+
+    t1 = _num(ai_result.get("target1_price"))
+    t2 = _num(ai_result.get("target2_price"))
+    legacy_target = _num(ai_result.get("target_price"))
+
+    # Derive entry premium for backfilling
+    entry_range = str(ai_result.get("entry_price_range") or "")
+    entry_low = entry_high = 0.0
+    if "-" in entry_range:
+        parts = entry_range.replace("₹","").split("-")
+        try:
+            entry_low = float(parts[0].strip())
+            entry_high = float(parts[1].strip())
+        except Exception:
+            pass
+    entry_mid = (entry_low + entry_high) / 2 if entry_low and entry_high else legacy_target / (1 + p["target_pct"]/100) if legacy_target > 0 else 0
+
+    # Backfill T1 if missing
+    if t1 <= 0:
+        if legacy_target > 0 and entry_mid > 0:
+            # Derive T1 from the legacy target (treat legacy as T2 and halve the gain)
+            legacy_gain_pct = (legacy_target - entry_mid) / max(entry_mid, 0.1) * 100
+            # T1 at ~half the legacy target gain, capped at profile's T1 rule
+            t1_pct = min(legacy_gain_pct * 0.55, p["target1_pct"])
+            t1 = round(entry_mid * (1 + t1_pct / 100), 1)
+        elif entry_mid > 0:
+            t1 = round(entry_mid * (1 + p["target1_pct"] / 100), 1)
+        ai_result["target1_price"] = t1
+
+    # Backfill T2 if missing
+    if t2 <= 0:
+        if legacy_target > 0:
+            t2 = legacy_target  # Legacy target was the "stretch" target
+        elif entry_mid > 0:
+            t2 = round(entry_mid * (1 + p["target2_pct"] / 100), 1)
+        ai_result["target2_price"] = t2
+
+    # Ensure legacy target_price is populated for older UI code paths
+    if legacy_target <= 0 and t1 > 0:
+        ai_result["target_price"] = t1
+
+    # Backfill time estimates if missing
+    if not ai_result.get("target1_time"):
+        ai_result["target1_time"] = "15-25 min"
+    if not ai_result.get("target2_time"):
+        ai_result["target2_time"] = ai_result.get("holding_period", "30-60 min")
+
+    # Backfill position management if missing
+    if not ai_result.get("position_management"):
+        ai_result["position_management"] = (
+            f"Book 50-75% at T1 ₹{t1:.1f} → trail SL to entry → "
+            f"let rest run to T2 ₹{t2:.1f} → hard exit at end of timeframe"
+        )
+
     return ai_result
 
 

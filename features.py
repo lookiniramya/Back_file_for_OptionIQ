@@ -177,7 +177,14 @@ def start_trade(ai_result: Dict, live_price: Dict, option_data: Dict):
     action       = ai_result.get("action", "")
     entry_strike = int(ai_result.get("entry_strike", round(spot/50)*50))
     entry_price  = ai_result.get("entry_price_range", "0-0")
-    target       = float(ai_result.get("target_price", 0) or 0)
+    # Two-tier targets — T1 is primary, T2 is stretch
+    target1      = float(ai_result.get("target1_price", 0) or 0)
+    target2      = float(ai_result.get("target2_price", 0) or 0)
+    # Fall back to legacy target_price if T1/T2 missing
+    legacy_tgt   = float(ai_result.get("target_price", 0) or 0)
+    if target1 <= 0:
+        target1 = legacy_tgt
+    target = target1 if target1 > 0 else legacy_tgt  # backward-compat field
     sl           = float(ai_result.get("stop_loss_price", 0) or 0)
     timeframe    = ai_result.get("timeframe", "30 min")
 
@@ -209,7 +216,11 @@ def start_trade(ai_result: Dict, live_price: Dict, option_data: Dict):
         "strike":       entry_strike,
         "option_type":  "CE" if is_call else "PE",
         "entry_price":  round(opt_ltp, 2),
-        "target":       round(target, 2),
+        "target":       round(target, 2),       # Legacy field (= T1)
+        "target1":      round(target1, 2),
+        "target2":      round(target2, 2) if target2 > 0 else 0,
+        "t1_hit":       False,                  # flips True when LTP first touches T1
+        "t2_hit":       False,
         "sl":           round(sl, 2),
         "current_ltp":  round(opt_ltp, 2),
         "entry_time":   datetime.now(),
@@ -242,6 +253,15 @@ def update_trade_ltp(option_data: Dict):
                     entry = trade["entry_price"]
                     if entry > 0:
                         trade["pnl_pct"] = round((ltp - entry) / entry * 100, 1)
+                    # Two-tier hit detection — flip flags when LTP first touches targets
+                    t1 = trade.get("target1", 0) or 0
+                    t2 = trade.get("target2", 0) or 0
+                    if t1 > 0 and not trade.get("t1_hit") and ltp >= t1:
+                        trade["t1_hit"] = True
+                        trade["t1_hit_time"] = datetime.now()
+                    if t2 > 0 and not trade.get("t2_hit") and ltp >= t2:
+                        trade["t2_hit"] = True
+                        trade["t2_hit_time"] = datetime.now()
                     break
         except:
             continue
@@ -296,14 +316,35 @@ def render_live_tracker(option_data: Dict):
     now       = datetime.now()
     entry     = trade["entry_price"]
     current   = trade["current_ltp"]
-    target    = trade["target"]
+    target    = trade["target"]                     # legacy = T1
+    target1   = trade.get("target1", target) or target
+    target2   = trade.get("target2", 0) or 0
+    t1_hit    = trade.get("t1_hit", False)
+    t2_hit    = trade.get("t2_hit", False)
     sl        = trade["sl"]
     pnl_pct   = trade["pnl_pct"]
     time_left = max(0, int((trade["exit_by"] - now).total_seconds() / 60))
     elapsed   = int((now - trade["entry_time"]).total_seconds() / 60)
 
-    # Auto-close detection
-    if current >= target and trade["status"] == "ACTIVE":
+    # Auto-close logic — only T2 (stretch target) auto-closes the full trade.
+    # When T1 hits, we show an alert but let the user decide (they should book
+    # 50-75% and trail the rest). This matches the two-tier philosophy.
+    if t1_hit and not trade.get("_t1_alerted"):
+        trade["_t1_alerted"] = True  # only alert once
+        st.success(
+            f"🎯 **TARGET 1 HIT at ₹{target1:.0f}!** "
+            f"Book 50-75% of position now and trail SL to entry (₹{entry:.0f}). "
+            f"Let remainder run to T2 ₹{target2:.0f}."
+        )
+        st.balloons()
+    if t2_hit and trade["status"] == "ACTIVE":
+        close_trade("TARGET")
+        st.success(f"🚀 TARGET 2 HIT at ₹{target2:.0f}! Full trade closed.")
+        st.balloons()
+        st.rerun()
+        return
+    # Fallback: if only T1 exists (no T2), close at T1 like before
+    if target2 <= 0 and current >= target1 and trade["status"] == "ACTIVE":
         close_trade("TARGET")
         st.success("🎯 TARGET HIT! Trade closed automatically.")
         st.balloons()
@@ -317,11 +358,13 @@ def render_live_tracker(option_data: Dict):
     if time_left == 0 and trade["status"] == "ACTIVE":
         st.warning("⏰ Time window expired! Exit recommended.")
 
-    # Color logic
+    # Color logic — progress bar tracks against T2 if available, else T1
+    progress_target = target2 if target2 > 0 else target1
     pnl_color = "#2e7d32" if pnl_pct > 0 else "#c62828" if pnl_pct < -5 else "#ffcc00"
-    to_target  = round((target - current) / entry * 100, 1) if entry > 0 else 0
+    to_t1      = round((target1 - current) / entry * 100, 1) if entry > 0 else 0
+    to_t2      = round((target2 - current) / entry * 100, 1) if (entry > 0 and target2 > 0) else 0
     to_sl      = round((current - sl) / entry * 100, 1) if entry > 0 else 0
-    progress   = max(0, min(100, (current - sl) / (target - sl) * 100)) if target != sl else 50
+    progress   = max(0, min(100, (current - sl) / (progress_target - sl) * 100)) if progress_target != sl else 50
 
     lots     = trade.get("lots", 1)
     lot_size = trade.get("lot_size", 75)
@@ -329,6 +372,25 @@ def render_live_tracker(option_data: Dict):
 
     action_icon = "📈" if "CALL" in trade["action"] else "📉"
     time_color  = "#c62828" if time_left <= 5 else "#ffcc00" if time_left <= 15 else "#2e7d32"
+
+    # T1/T2 target column renderers — greened out when hit
+    t1_bg = "#c8e6c9" if t1_hit else "#e8f5e9"
+    t1_color = "#1b5e20"
+    t1_badge = "✅ HIT" if t1_hit else "T1 (Primary)"
+    t2_bg = "#ffccbc" if t2_hit else "#fff3e0"
+    t2_color = "#bf360c"
+    t2_badge = "✅ HIT" if t2_hit else "T2 (Stretch)"
+
+    # Build targets cells — 5-column layout (Entry, Current, T1, T2, SL)
+    # If T2 is 0 (legacy single-target trade), collapse to 4-column layout.
+    show_t2 = target2 > 0
+    grid_cols = "1fr 1fr 1fr 1fr 1fr" if show_t2 else "1fr 1fr 1fr 1fr"
+    t2_cell = (
+        f'<div style="background:{t2_bg};border-radius:6px;padding:0.5rem;text-align:center">'
+        f'<div style="font-size:0.55rem;color:#78909c">{t2_badge}</div>'
+        f'<div style="font-size:1rem;font-weight:700;color:{t2_color};font-family:monospace">₹{target2:.0f}</div>'
+        f'</div>'
+    ) if show_t2 else ""
 
     st.markdown(f"""
     <div style="background:#ffffff;border:1px solid #e0e4ec;border-radius:12px;padding:1rem;margin-bottom:0.8rem">
@@ -348,21 +410,22 @@ def render_live_tracker(option_data: Dict):
             </div>
         </div>
 
-        <div style="display:grid;grid-template-columns:1fr 1fr 1fr 1fr;gap:8px;margin-bottom:0.8rem">
+        <div style="display:grid;grid-template-columns:{grid_cols};gap:6px;margin-bottom:0.8rem">
             <div style="background:#f0f2f6;border-radius:6px;padding:0.5rem;text-align:center">
-                <div style="font-size:0.6rem;color:#78909c">ENTRY</div>
+                <div style="font-size:0.55rem;color:#78909c">ENTRY</div>
                 <div style="font-size:1rem;font-weight:700;color:#546e7a;font-family:monospace">₹{entry:.0f}</div>
             </div>
             <div style="background:#f0f2f6;border-radius:6px;padding:0.5rem;text-align:center">
-                <div style="font-size:0.6rem;color:#78909c">CURRENT</div>
+                <div style="font-size:0.55rem;color:#78909c">LTP</div>
                 <div style="font-size:1rem;font-weight:700;color:{pnl_color};font-family:monospace">₹{current:.0f}</div>
             </div>
-            <div style="background:#e8f5e9;border-radius:6px;padding:0.5rem;text-align:center">
-                <div style="font-size:0.6rem;color:#78909c">TARGET</div>
-                <div style="font-size:1rem;font-weight:700;color:#1b5e20;font-family:monospace">₹{target:.0f}</div>
+            <div style="background:{t1_bg};border-radius:6px;padding:0.5rem;text-align:center">
+                <div style="font-size:0.55rem;color:#78909c">{t1_badge}</div>
+                <div style="font-size:1rem;font-weight:700;color:{t1_color};font-family:monospace">₹{target1:.0f}</div>
             </div>
+            {t2_cell}
             <div style="background:#fce8e8;border-radius:6px;padding:0.5rem;text-align:center">
-                <div style="font-size:0.6rem;color:#78909c">STOP LOSS</div>
+                <div style="font-size:0.55rem;color:#78909c">STOP LOSS</div>
                 <div style="font-size:1rem;font-weight:700;color:#c62828;font-family:monospace">₹{sl:.0f}</div>
             </div>
         </div>
@@ -381,19 +444,27 @@ def render_live_tracker(option_data: Dict):
                 </span>
             </div>
             <div style="font-size:0.7rem;color:#78909c;text-align:right">
-                To Target: {to_target:+.1f}% · To SL: {to_sl:.1f}% · {elapsed}m elapsed
+                To T1: {to_t1:+.1f}%{' · To T2: ' + f'{to_t2:+.1f}%' if show_t2 else ''} · To SL: {to_sl:.1f}% · {elapsed}m elapsed
             </div>
         </div>
     </div>""", unsafe_allow_html=True)
 
-    c1, c2, c3 = st.columns(3)
+    c1, c2, c3, c4 = st.columns(4)
     with c1:
-        if st.button("🎯 Mark TARGET Hit", use_container_width=True):
-            close_trade("TARGET"); st.rerun()
+        if st.button("✂️ Book at T1", use_container_width=True,
+                     help="Partial exit at T1 — marks T1 hit but keeps trade active for T2",
+                     disabled=t1_hit):
+            trade["t1_hit"] = True
+            trade["t1_hit_time"] = datetime.now()
+            st.success("✅ T1 booked. Trail SL to entry and let rest run to T2.")
+            st.rerun()
     with c2:
-        if st.button("🛑 Mark SL Hit", use_container_width=True):
-            close_trade("SL"); st.rerun()
+        if st.button("🎯 Close at TARGET", use_container_width=True):
+            close_trade("TARGET"); st.rerun()
     with c3:
+        if st.button("🛑 Close at SL", use_container_width=True):
+            close_trade("SL"); st.rerun()
+    with c4:
         if st.button("🚪 Exit Manually", use_container_width=True):
             close_trade("MANUAL"); st.rerun()
 
@@ -447,24 +518,67 @@ def compute_oi_velocity(df_calls: pd.DataFrame, df_puts: pd.DataFrame,
     cover_calls   = sum(1 for s in results["call_surges"] if s["oi_chg"] < -20)
     cover_puts    = sum(1 for s in results["put_surges"]  if s["oi_chg"] < -20)
 
+    # Also compare the MAGNITUDE of writing, not just strike count.
+    # Two strikes with +500% OI change is far more meaningful than three
+    # strikes with +50%. We weight by total % change summed across strikes.
+    call_write_mag = sum(s["oi_chg"] for s in results["call_surges"] if s["oi_chg"] > 30)
+    put_write_mag  = sum(s["oi_chg"] for s in results["put_surges"]  if s["oi_chg"] > 30)
+
+    # Determine bias using BOTH count and magnitude — prefer the side with
+    # stronger writing activity overall, not just the first side to cross
+    # the threshold (the old code always triggered on CALL writing first
+    # due to if/elif order, making bias mostly BEARISH).
+    call_strength = fresh_calls * 100 + call_write_mag   # count weighted + magnitude
+    put_strength  = fresh_puts  * 100 + put_write_mag
+
+    # Need a meaningful gap (15%) between sides to call a directional bias,
+    # otherwise it's NEUTRAL (heavy writing on both sides = indecision).
+    total = call_strength + put_strength
+    gap   = abs(call_strength - put_strength)
+    decisive = total > 0 and (gap / total) >= 0.15
+
     if fresh_puts > fresh_calls and cover_calls > 0:
+        # Classic bullish: puts being written + calls being covered
         results["bias"] = "BULLISH"
         results["signals"].append("✅ Fresh PUT writing + CALL covering = bullish pressure")
     elif fresh_calls > fresh_puts and cover_puts > 0:
+        # Classic bearish: calls being written + puts being covered
         results["bias"] = "BEARISH"
         results["signals"].append("⚠️ Fresh CALL writing + PUT covering = bearish resistance")
-    elif fresh_calls > 2:
-        results["bias"] = "BEARISH"
-        results["signals"].append(f"⚠️ {fresh_calls} strikes with heavy fresh CALL writing = resistance building")
-    elif fresh_puts > 2:
+    elif decisive and put_strength > call_strength:
+        # More/stronger PUT writing = put writers confident support will hold
         results["bias"] = "BULLISH"
-        results["signals"].append(f"✅ {fresh_puts} strikes with heavy fresh PUT writing = support building")
+        results["signals"].append(
+            f"✅ {fresh_puts} strikes with heavy fresh PUT writing "
+            f"(net magnitude {put_write_mag:+.0f}%) — support building"
+        )
+    elif decisive and call_strength > put_strength:
+        # More/stronger CALL writing = call writers confident resistance will hold
+        results["bias"] = "BEARISH"
+        results["signals"].append(
+            f"⚠️ {fresh_calls} strikes with heavy fresh CALL writing "
+            f"(net magnitude {call_write_mag:+.0f}%) — resistance building"
+        )
+    elif fresh_calls + fresh_puts >= 4:
+        # Heavy writing on BOTH sides with no clear winner = indecision
+        results["bias"] = "NEUTRAL"
+        results["signals"].append(
+            f"⚖️ Heavy two-way writing ({fresh_calls} CE vs {fresh_puts} PE) "
+            f"— indecision, watch for breakout"
+        )
     elif cover_calls > 1:
-        results["signals"].append("✅ CALL unwinding in progress — short covering may push market up")
+        results["bias"] = "BULLISH"
+        results["signals"].append("✅ CALL unwinding — short covering may push market up")
     elif cover_puts > 1:
+        results["bias"] = "BEARISH"
         results["signals"].append("⚠️ PUT unwinding — support weakening")
     else:
+        results["bias"] = "NEUTRAL"
         results["signals"].append("⚖️ No significant OI velocity signals")
+
+    # Expose the strength numbers for debugging / transparency
+    results["call_strength"] = round(call_strength, 1)
+    results["put_strength"]  = round(put_strength, 1)
 
     return results
 
@@ -481,6 +595,25 @@ def render_oi_velocity(velocity: Dict):
         <span style="background:{bc}22;border:1px solid {bc};border-radius:4px;
                      padding:2px 8px;font-size:0.72rem;color:{bc};font-weight:700">{bias}</span>
     </div>""", unsafe_allow_html=True)
+
+    # ── Strength comparison bar — shows Call vs Put writing strength visually
+    call_str = float(velocity.get("call_strength", 0) or 0)
+    put_str  = float(velocity.get("put_strength",  0) or 0)
+    total    = call_str + put_str
+    if total > 0:
+        call_pct = (call_str / total) * 100
+        put_pct  = (put_str  / total) * 100
+        st.markdown(f"""
+        <div style="margin:4px 0 8px 0;">
+            <div style="display:flex;justify-content:space-between;font-size:0.65rem;color:#78909c;margin-bottom:2px">
+                <span>⚠️ CALL writing: {call_pct:.0f}%</span>
+                <span>PUT writing: {put_pct:.0f}% ✅</span>
+            </div>
+            <div style="display:flex;height:8px;border-radius:4px;overflow:hidden;background:#f0f0f0">
+                <div style="width:{call_pct}%;background:#c62828"></div>
+                <div style="width:{put_pct}%;background:#2e7d32"></div>
+            </div>
+        </div>""", unsafe_allow_html=True)
 
     if sigs:
         for s in sigs:

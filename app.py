@@ -1941,8 +1941,17 @@ def _render_ai_result(result: dict, symbol: str, atm: float):
     entry_t       = ss(result.get("entry_type"),        "ATM")
     entry_r       = ss(result.get("entry_price_range"), "N/A")
     target        = sf(result.get("target_price"),      0)
+    # Two-tier targets
+    target1       = sf(result.get("target1_price"),     target)
+    target2       = sf(result.get("target2_price"),     0)
+    target1_time  = ss(result.get("target1_time"),      "15-25 min")
+    target2_time  = ss(result.get("target2_time"),      "30-60 min")
+    target1_move  = ss(result.get("target1_index_move"),"")
+    target2_move  = ss(result.get("target2_index_move"),"")
+    pos_mgmt      = ss(result.get("position_management"), "")
     sl            = sf(result.get("stop_loss_price"),   0)
     rr            = ss(result.get("risk_reward"),       "—")
+    rr_t1         = ss(result.get("risk_reward_t1"),    "—")
     max_lots      = int(sf(result.get("max_lots"),      2))
     margin        = ss(result.get("approx_margin"),     "—")
     hold          = ss(result.get("holding_period"),    "—")
@@ -2019,17 +2028,87 @@ def _render_ai_result(result: dict, symbol: str, atm: float):
         """, unsafe_allow_html=True)
 
         st.markdown("**📌 Trade Setup**")
-        c1, c2 = st.columns(2)
-        with c1:
-            st.metric("Entry Strike", f"₹{int(entry_s):,}" if entry_s > 0 else "—")
-            st.metric("Target (Option LTP)", f"₹{target:.0f}" if target > 0 else "—")
-        with c2:
-            st.metric("Entry Type", entry_t)
-            st.metric("Stop Loss (Option LTP)", f"₹{sl:.0f}" if sl > 0 else "—")
 
+        # Entry + SL row
+        c_es1, c_es2 = st.columns(2)
+        with c_es1:
+            st.metric("Entry Strike", f"₹{int(entry_s):,}" if entry_s > 0 else "—")
+            st.metric("Entry Type", entry_t)
+        with c_es2:
+            st.metric("Entry Range", f"₹{entry_r}")
+            st.metric("Stop Loss (LTP)", f"₹{sl:.0f}" if sl > 0 else "—")
+
+        # ── Two-tier Target Cards ─────────────────────────────────────────
+        st.markdown("**🎯 Targets (Book in Stages)**")
+        if target1 > 0 or target2 > 0:
+            # Compute percentage gains for display
+            entry_mid = 0.0
+            try:
+                parts = entry_r.replace("₹", "").split("-")
+                if len(parts) == 2:
+                    entry_mid = (float(parts[0]) + float(parts[1])) / 2
+            except Exception:
+                pass
+            t1_gain = ((target1 - entry_mid) / entry_mid * 100) if (entry_mid > 0 and target1 > 0) else 0
+            t2_gain = ((target2 - entry_mid) / entry_mid * 100) if (entry_mid > 0 and target2 > 0) else 0
+
+            ct1, ct2 = st.columns(2)
+            with ct1:
+                st.markdown(f"""
+                <div style="background:linear-gradient(135deg,#e8f5e9,#fff);
+                            border:2px solid #66bb6a;border-radius:10px;padding:12px 14px;
+                            box-shadow:0 1px 4px rgba(0,0,0,.05)">
+                    <div style="font-size:0.6rem;color:#2e7d32;font-weight:700;letter-spacing:1.5px;
+                                text-transform:uppercase;margin-bottom:4px">🎯 Target 1 · PRIMARY</div>
+                    <div style="font-family:'JetBrains Mono',monospace;font-size:1.5rem;font-weight:700;
+                                color:#1b5e20;line-height:1.1">₹{target1:.0f}</div>
+                    <div style="font-size:0.72rem;color:#546e7a;margin-top:4px">
+                        {f'+{t1_gain:.0f}% gain' if t1_gain > 0 else ''}
+                        {'·' if t1_gain > 0 and target1_time != '—' else ''}
+                        {target1_time if target1_time != '—' else ''}
+                    </div>
+                    {f'<div style="font-size:0.66rem;color:#78909c;margin-top:3px;font-style:italic">{target1_move}</div>' if target1_move and target1_move != '—' else ''}
+                    <div style="font-size:0.7rem;color:#2e7d32;margin-top:6px;font-weight:600">
+                        ✂️ Book 50-75% here
+                    </div>
+                </div>""", unsafe_allow_html=True)
+
+            with ct2:
+                st.markdown(f"""
+                <div style="background:linear-gradient(135deg,#fff3e0,#fff);
+                            border:2px solid #ffb74d;border-radius:10px;padding:12px 14px;
+                            box-shadow:0 1px 4px rgba(0,0,0,.05)">
+                    <div style="font-size:0.6rem;color:#e65100;font-weight:700;letter-spacing:1.5px;
+                                text-transform:uppercase;margin-bottom:4px">🚀 Target 2 · STRETCH</div>
+                    <div style="font-family:'JetBrains Mono',monospace;font-size:1.5rem;font-weight:700;
+                                color:#bf360c;line-height:1.1">{'₹' + f'{target2:.0f}' if target2 > 0 else '—'}</div>
+                    <div style="font-size:0.72rem;color:#546e7a;margin-top:4px">
+                        {f'+{t2_gain:.0f}% gain' if t2_gain > 0 else ''}
+                        {'·' if t2_gain > 0 and target2_time != '—' else ''}
+                        {target2_time if target2_time != '—' else ''}
+                    </div>
+                    {f'<div style="font-size:0.66rem;color:#78909c;margin-top:3px;font-style:italic">{target2_move}</div>' if target2_move and target2_move != '—' else ''}
+                    <div style="font-size:0.7rem;color:#e65100;margin-top:6px;font-weight:600">
+                        💨 Trail rest to here
+                    </div>
+                </div>""", unsafe_allow_html=True)
+
+            # Position management callout
+            if pos_mgmt and pos_mgmt != "—":
+                st.markdown(f"""
+                <div style="background:#f0f4ff;border:1px solid #c5cae9;border-left:4px solid #3949ab;
+                            border-radius:0 8px 8px 0;padding:10px 14px;margin-top:10px">
+                    <div style="font-size:0.62rem;color:#1a237e;font-weight:700;letter-spacing:1.5px;
+                                text-transform:uppercase;margin-bottom:4px">📋 Position Management</div>
+                    <div style="font-size:0.82rem;color:#283593;line-height:1.5">{pos_mgmt}</div>
+                </div>""", unsafe_allow_html=True)
+        else:
+            st.info("Target data not available in this recommendation.")
+
+        # Trade summary row
         c3, c4, c5 = st.columns(3)
-        with c3: st.metric("Entry Range", f"₹{entry_r}")
-        with c4: st.metric("Risk:Reward", rr)
+        with c3: st.metric("Risk:Reward (T2)", rr)
+        with c4: st.metric("R:R @ T1", rr_t1 if rr_t1 != "—" else "—")
         with c5: st.metric("Hold", hold.replace("Intraday","Intrad.") if hold else "—")
 
         c6, c7, c8 = st.columns(3)
