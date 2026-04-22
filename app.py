@@ -112,6 +112,7 @@ def init_state():
         "_last_auto_fetch_ts": None,
         "_refresh_paused": False,
         "_ai_click_pending": False,
+        "_last_ai_error": None,
         "market_status": None,
         "anthropic_api_key": "",
         "ws_enabled": False,
@@ -1824,24 +1825,64 @@ def page_dashboard():
                     profile_name=st.session_state.risk_profile,
                 )
                 # Only replace the existing ai_result if the new one looks
-                # valid — this prevents a transient "AI key not set" error
-                # from wiping a working pinned recommendation.
+                # valid — this prevents a transient error from wiping a
+                # working pinned recommendation.
                 if isinstance(result, dict) and "error" not in result:
                     st.session_state.ai_result = result
                     st.session_state.ai_result_timestamp = datetime.now()
+                    st.session_state._last_ai_error = None   # clear stale errors
                 elif isinstance(result, dict) and "error" in result:
-                    # Show the error once, but keep the pinned result
-                    st.error(f"❌ AI Error: {result.get('error', 'Unknown')}. "
-                             f"Previous recommendation kept.")
+                    # Persist the error across rerun so the user actually sees it.
+                    # The rerun below would wipe any st.error() called here.
+                    st.session_state._last_ai_error = {
+                        "message":      result.get("error", "Unknown error"),
+                        "status_code":  result.get("status_code"),
+                        "raw_response": result.get("raw_response", ""),
+                        "traceback":    result.get("traceback", ""),
+                        "at":           datetime.now(),
+                    }
             except Exception as _ai_e:
-                st.error(f"❌ AI call failed: {_ai_e}. Previous recommendation kept.")
+                import traceback as _tb
+                st.session_state._last_ai_error = {
+                    "message":   f"AI call exception: {type(_ai_e).__name__}: {_ai_e}",
+                    "traceback": _tb.format_exc()[:1000],
+                    "at":        datetime.now(),
+                }
             finally:
                 st.session_state.ai_loading = False
                 # Auto-resume refresh if it was paused by the AI click flow.
-                # (If the user manually clicked "Pause Refresh" before the AI
-                # click, they can re-enable it with "Resume Refresh".)
                 st.session_state._refresh_paused = False
             st.rerun()
+
+    # ── AI Error Display (persists across rerun) ─────────────────────────
+    _ai_err = st.session_state.get("_last_ai_error")
+    if _ai_err:
+        err_age = (datetime.now() - _ai_err["at"]).total_seconds()
+        # Auto-clear errors older than 5 minutes so they don't haunt the UI
+        if err_age > 300:
+            st.session_state._last_ai_error = None
+        else:
+            status = _ai_err.get("status_code")
+            status_badge = f" (HTTP {status})" if status else ""
+            st.error(
+                f"❌ **AI Error{status_badge}:** {_ai_err['message']}  \n"
+                f"_Previous pinned recommendation (if any) has been kept._",
+                icon="🔧",
+            )
+            # Expandable debug info for diagnosing API issues
+            if _ai_err.get("raw_response") or _ai_err.get("traceback"):
+                with st.expander("🔍 Debug details (click to expand)"):
+                    if _ai_err.get("raw_response"):
+                        st.caption("Raw API response:")
+                        st.code(_ai_err["raw_response"], language="json")
+                    if _ai_err.get("traceback"):
+                        st.caption("Exception traceback:")
+                        st.code(_ai_err["traceback"], language="python")
+            col_dismiss = st.columns([4, 1])[1]
+            with col_dismiss:
+                if st.button("✖ Dismiss", key="dismiss_ai_err", use_container_width=True):
+                    st.session_state._last_ai_error = None
+                    st.rerun()
 
     # ── AI Result Display ─────────────────────────────────────────────────
     if st.session_state.ai_result:

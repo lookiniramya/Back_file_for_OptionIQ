@@ -913,23 +913,48 @@ def get_ai_analysis(
                 "anthropic-version": "2023-06-01",
             },
             json={
-                "model":      "claude-sonnet-4-6",
+                # Valid Anthropic API model IDs. If you want the newest, use
+                # "claude-opus-4-5" or "claude-opus-4-7" (more expensive).
+                # Sonnet 4.5 is plenty capable for structured JSON trade calls
+                # and about 5x cheaper than Opus per token.
+                "model":      "claude-sonnet-4-5",
                 "max_tokens": 3000,
                 "system":     system_prompt,
                 "messages":   [{"role": "user", "content": user_message}],
             },
-            timeout=40,
+            timeout=60,   # bumped from 40 — long prompts can legitimately take >30s
         )
 
         if resp.status_code != 200:
-            return {"error": f"API error {resp.status_code}: {resp.text[:400]}"}
+            # Surface the actual API error to the user so they can see what's wrong
+            err_text = resp.text[:600] if resp.text else "(empty response body)"
+            return {
+                "error": f"API error {resp.status_code}: {err_text}",
+                "status_code": resp.status_code,
+            }
+
+        resp_json = resp.json()
+
+        # Check for content blocks — if missing, show the raw response
+        content_blocks = resp_json.get("content", [])
+        if not content_blocks:
+            return {
+                "error": "AI returned no content blocks",
+                "raw_response": json.dumps(resp_json)[:600],
+            }
 
         raw = ""
-        for block in resp.json().get("content", []):
+        for block in content_blocks:
             if block.get("type") == "text":
                 raw += block.get("text", "")
 
         raw = raw.strip()
+        if not raw:
+            return {
+                "error": "AI returned empty text. Try again or check the model name.",
+                "raw_response": json.dumps(resp_json)[:600],
+            }
+
         # Strip markdown fences
         if "```" in raw:
             parts = raw.split("```")
@@ -946,10 +971,14 @@ def get_ai_analysis(
         return result
 
     except json.JSONDecodeError as e:
-        return {"error": f"JSON parse error: {e}", "raw_response": raw[:600]}
+        return {"error": f"JSON parse error: {e}", "raw_response": raw[:600] if 'raw' in dir() else ''}
     except requests.exceptions.Timeout:
-        return {"error": "AI request timed out (40s). Try again."}
-    except requests.exceptions.ConnectionError:
-        return {"error": "Cannot connect to AI API. Check internet."}
+        return {"error": "AI request timed out (60s). Try again — market context may be too large."}
+    except requests.exceptions.ConnectionError as e:
+        return {"error": f"Cannot connect to AI API: {e}"}
     except Exception as e:
-        return {"error": f"Unexpected error: {str(e)}"}
+        import traceback
+        return {
+            "error": f"Unexpected error: {type(e).__name__}: {str(e)}",
+            "traceback": traceback.format_exc()[:800],
+        }
