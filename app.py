@@ -176,6 +176,57 @@ def _news_is_stale(max_age_minutes=10):
     return (datetime.now() - ts).total_seconds() >= max_age_minutes * 60
 
 
+def _compute_ai_time_context(mkt: dict, selected_expiry: str | None = None) -> dict:
+    """Build the time-awareness dict that the AI prompt uses to scale targets
+    and holding period to what's actually achievable before market close."""
+    from datetime import datetime as _dt, time as _t
+    now = _dt.now()
+    is_open = bool(mkt.get("is_open"))
+    today_str = mkt.get("current_date", now.strftime("%d-%b-%Y"))
+
+    # Minutes until NSE close (15:30 IST)
+    close_time = now.replace(hour=15, minute=30, second=0, microsecond=0)
+    mtc = 0
+    if is_open and now < close_time:
+        mtc = int((close_time - now).total_seconds() // 60)
+
+    # Session phase
+    if not is_open:
+        phase = "CLOSED"
+    elif mtc <= 15:
+        phase = "FINAL_MINUTES"
+    elif mtc <= 45:
+        phase = "LAST_HOUR"
+    elif mtc <= 120:
+        phase = "LATE_SESSION"
+    elif now.hour < 11:
+        phase = "EARLY_SESSION"
+    else:
+        phase = "MIDDAY"
+
+    # Is today an expiry day? Check if selected expiry matches today
+    is_expiry_day = False
+    if selected_expiry:
+        try:
+            # selected_expiry format is typically "28-04-2026" or "28-Apr-2026"
+            se = str(selected_expiry).strip().lower().replace("-", " ")
+            td = today_str.strip().lower().replace("-", " ")
+            # crude match — if the day and month-year match up
+            is_expiry_day = (se.split()[0] == td.split()[0] and
+                             se.split()[-1] == td.split()[-1])
+        except Exception:
+            pass
+
+    return {
+        "minutes_to_close":  mtc,
+        "session_phase":     phase,
+        "current_time_ist":  now.strftime("%H:%M IST"),
+        "current_date":      today_str,
+        "is_expiry_day":     is_expiry_day,
+        "is_open":           is_open,
+    }
+
+
 def _get_live_price_with_ws_fallback(token, symbol, option_data):
     feed = get_feed()
     if (
@@ -1695,6 +1746,35 @@ def page_dashboard():
     with col_btn2:
         profile_label = get_profile(st.session_state.risk_profile)["label"]
 
+        # ── Time-to-close banner — tells user what kind of trade AI will suggest
+        _btn_tc = _compute_ai_time_context(mkt, st.session_state.get("selected_expiry"))
+        _mtc = _btn_tc["minutes_to_close"]
+        if _btn_tc["session_phase"] == "CLOSED":
+            st.info("🌙 Market closed — AI will suggest a **PRE-MARKET PLAN** for next session", icon="🌙")
+        elif _mtc <= 15:
+            st.error(
+                f"🔴 **CRITICAL: only {_mtc} min to close** — AI will force scalp mode "
+                f"(single fast target, book full at T1). Consider waiting for next session if no clean setup.",
+                icon="⏰",
+            )
+        elif _mtc <= 30:
+            st.warning(
+                f"🟡 **{_mtc} min to close** — AI will use tight targets (capped at ~20-35% gain) "
+                f"that must complete before 15:30 IST.",
+                icon="⏰",
+            )
+        elif _mtc <= 60:
+            st.info(
+                f"🟢 **{_mtc} min to close** — AI targets will be capped to fit before 15:30 IST.",
+                icon="⏰",
+            )
+        if _btn_tc["is_expiry_day"]:
+            st.warning(
+                "🔥 **EXPIRY DAY** — Theta decay is brutal. "
+                "AI will prefer ATM/ITM and very short timeframes.",
+                icon="🔥",
+            )
+
         # ── Pause Refresh toggle right above the AI button ─────────────────
         # Gives the user a reliable way to stop auto-refresh so they can
         # comfortably click the AI button without widgets being disabled
@@ -1794,16 +1874,24 @@ def page_dashboard():
                         pass
                 if _extra:
                     context += "\n" + "\n".join(_extra)
-                # Add market context note
-                mkt_note = f"Market Status: {mkt['status']} as of {mkt['current_ist']}."
+                # Add market context note WITH time-to-close awareness
+                _tc = _compute_ai_time_context(mkt, st.session_state.get("selected_expiry"))
+                mkt_note = (
+                    f"Market Status: {mkt['status']} as of {mkt['current_ist']}. "
+                    f"Minutes until 15:30 IST close: {_tc['minutes_to_close']}. "
+                    f"Session phase: {_tc['session_phase']}."
+                )
                 if not mkt['is_open']:
                     mkt_note += f" Data is from last trading session ({mkt['last_trading_day']})."
+                if _tc['is_expiry_day']:
+                    mkt_note += " ⚠️ TODAY IS EXPIRY DAY for the selected strike."
                 full_note = mkt_note + ("\n" + user_note if user_note else "")
-                with st.spinner("🧠 AI analyzing all market factors... (10-20 seconds)"):
+                with st.spinner(f"🧠 AI analyzing... ({_tc['minutes_to_close']} min to close)"):
                     result = get_ai_analysis(
                         context,
                         full_note,
                         profile_name=st.session_state.risk_profile,
+                        time_context=_tc,
                     )
                 result = normalize_trade_recommendation(
                     result,

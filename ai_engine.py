@@ -106,14 +106,90 @@ def get_profile(profile_name: str) -> Dict:
     return RISK_PROFILES.get(profile_name.upper(), RISK_PROFILES["MODERATE"])
 
 
-def build_system_prompt(profile_name: str) -> str:
-    """Build the AI system prompt based on selected risk profile."""
+def build_system_prompt(profile_name: str, time_context: Dict[str, Any] | None = None) -> str:
+    """Build the AI system prompt based on selected risk profile and time context.
+
+    time_context keys (all optional):
+        minutes_to_close: int — minutes remaining in trading session
+        session_phase: str   — EARLY / MIDDAY / LATE / FINAL_HOUR / EXPIRY_HOUR / CLOSED
+        current_time_ist: str — e.g. '14:39 IST'
+        is_expiry_day: bool   — True if today is the weekly/monthly expiry
+    """
     p = get_profile(profile_name)
+    tc = time_context or {}
+    mtc = int(tc.get("minutes_to_close", 0) or 0)
+    phase = tc.get("session_phase", "UNKNOWN")
+    now_str = tc.get("current_time_ist", "")
+    is_expiry = bool(tc.get("is_expiry_day", False))
 
     strikes_ok   = ", ".join(p["strikes"])
     strikes_no   = ", ".join(p["avoid_strikes"])
     notes_str    = "\n".join([f"  • {n}" for n in p["notes"]])
     pcr_lo, pcr_hi = p["pcr_neutral_band"]
+
+    # ── Time-aware holding & target caps ────────────────────────────────────
+    # When the session is running out, force shorter, more realistic trades.
+    # The AI MUST NOT recommend a 60-minute trade when only 40 minutes remain.
+    if mtc <= 0 or phase == "CLOSED":
+        time_guidance = (
+            "🚫 MARKET IS CLOSED. Provide a PRE-MARKET PLANNING recommendation "
+            "for the next session open. Do NOT claim any target is achievable today."
+        )
+        max_hold_minutes = 60  # for next session
+        t1_cap_pct = p["target1_pct"]
+        t2_cap_pct = p["target2_pct"]
+    elif mtc <= 15:
+        time_guidance = (
+            f"🔴 CRITICAL: Only {mtc} MINUTES until 15:30 IST close. "
+            f"ONLY suggest SCALP trades with T1 achievable in <{mtc-2} min and T2 MUST equal T1 "
+            f"(no stretch — there is no time for T2 to play out). Recommend BOOK FULL at T1. "
+            f"If no clean scalp available, return NO TRADE with reason 'insufficient time remaining'."
+        )
+        max_hold_minutes = max(5, mtc - 2)
+        t1_cap_pct = min(20, p["target1_pct"])   # max 20% gain for 15-min scalp
+        t2_cap_pct = t1_cap_pct                  # no stretch at this hour
+    elif mtc <= 30:
+        time_guidance = (
+            f"🟡 IMPORTANT: Only {mtc} MINUTES until close. "
+            f"T1 must be reachable in ~{max(5, mtc//3)} min. "
+            f"T2 must be reachable in ~{mtc-3} min (NOT after close). "
+            f"Use conservative targets — this is end-of-session, not a full-session trade."
+        )
+        max_hold_minutes = mtc - 3
+        t1_cap_pct = min(20, p["target1_pct"])
+        t2_cap_pct = min(35, p["target2_pct"])
+    elif mtc <= 60:
+        time_guidance = (
+            f"🟢 {mtc} minutes until close. "
+            f"All times in your recommendation must fit BEFORE 15:30 IST close. "
+            f"If you suggest a 45-min trade, T1 and T2 must both complete before the bell. "
+            f"T2 should be reachable in ≤{mtc-5} minutes."
+        )
+        max_hold_minutes = mtc - 5
+        t1_cap_pct = p["target1_pct"]
+        t2_cap_pct = min(p["target2_pct"], max(40, int(p["target2_pct"] * 0.75)))
+    else:
+        # Plenty of time — use full profile targets
+        time_guidance = (
+            f"🟢 {mtc} minutes of session remaining. Normal intraday scalp — "
+            f"targets can use the full profile percentages."
+        )
+        max_hold_minutes = 60
+        t1_cap_pct = p["target1_pct"]
+        t2_cap_pct = p["target2_pct"]
+
+    expiry_warning = ""
+    if is_expiry:
+        if p["avoid_expiry"]:
+            expiry_warning = (
+                "\n🔥 EXPIRY DAY: This profile AVOIDS expiry day trading. "
+                "Strongly prefer NO TRADE unless confidence ≥ 85 AND strong confirming signals.\n"
+            )
+        else:
+            expiry_warning = (
+                "\n🔥 EXPIRY DAY: Theta decay is violent — premiums will collapse even if spot moves. "
+                "Use SHORTER timeframes (T1 in <15 min). OTM options decay to 0 fast — prefer ATM/ITM.\n"
+            )
 
     return f"""You are a senior NSE/BSE options trader with 15+ years of experience.
 You are advising a trader with a {profile_name.upper()} RISK profile. This is their PERMANENT preference.
@@ -123,13 +199,33 @@ Use every data source provided in the context: live market data, option chain, O
 If one side has a better edge than the other and market data is valid, choose that side instead of returning NO TRADE.
 
 ═══════════════════════════════════════════════════════════
+⏰ CURRENT MARKET TIME CONTEXT (READ THIS FIRST)
+═══════════════════════════════════════════════════════════
+Current time:       {now_str or 'unknown'}
+Session phase:      {phase}
+Minutes to close:   {mtc} min (NSE closes 15:30 IST sharp)
+Max holding allowed: {max_hold_minutes} minutes
+T1 % cap:           {t1_cap_pct}%
+T2 % cap:           {t2_cap_pct}%
+
+{time_guidance}
+{expiry_warning}
+🚨 ABSOLUTE TIME RULES:
+1. NEVER recommend a holding_period longer than {max_hold_minutes} minutes
+2. NEVER recommend T2_time that extends past 15:30 IST
+3. All "exit by HH:MM" statements in trade_plan MUST reference the actual current time ({now_str or 'now'}), not morning times like 09:50 AM
+4. If mtc <= 10 and no scalp edge is clear, choose NO TRADE — time decay alone will kill any position
+5. Targets must be ACHIEVABLE within time remaining, calibrated against recent 5-min candle range
+
+═══════════════════════════════════════════════════════════
 ACTIVE RISK PROFILE: {p['label'].upper()}
 {p['description']}
 ═══════════════════════════════════════════════════════════
 
 🎯 MANDATORY: ALWAYS PROVIDE A TRADE SUGGESTION
 You MUST give a BUY CALL or BUY PUT every time. If signals are weak → lower confidence + widen SL.
-If market is closed → give PRE-MARKET PLANNING direction. NO TRADE only if spot=0 and chain is empty.
+If market is closed → give PRE-MARKET PLANNING direction. NO TRADE only if spot=0 and chain is empty,
+OR if time remaining is insufficient for any realistic move (mtc <= 5).
 
 HARD RULES — NEVER VIOLATE:
 ✅ ALLOWED strikes:        {strikes_ok}
@@ -145,8 +241,8 @@ HARD RULES — NEVER VIOLATE:
 
 STOP LOSS & TARGET RULES (TWO-TIER TARGET SYSTEM):
 • Stop Loss:  {p['sl_pct']}% below entry premium  (e.g. entry ₹100 → SL ₹{100 - p['sl_pct']})
-• Target 1 (T1):  {p['target1_pct']}% above entry — realistic FIRST TARGET, achievable in ~40-60% of timeframe (e.g. entry ₹100 → T1 ₹{100 + p['target1_pct']})
-• Target 2 (T2):  {p['target2_pct']}% above entry — STRETCH target if momentum continues (e.g. entry ₹100 → T2 ₹{100 + p['target2_pct']})
+• Target 1 (T1):  {t1_cap_pct}% above entry — realistic FIRST TARGET (TIME-CAPPED to current session phase)
+• Target 2 (T2):  {t2_cap_pct}% above entry — STRETCH target (TIME-CAPPED to current session phase)
 • Holding:    {p['holding']}
 
 TARGET MANAGEMENT PHILOSOPHY:
@@ -882,8 +978,16 @@ def get_ai_analysis(
     market_context: str,
     user_note: str = "",
     profile_name: str = "MODERATE",
+    time_context: Dict[str, Any] | None = None,
 ) -> Dict[str, Any]:
-    """Call Claude API with profile-specific system prompt."""
+    """Call Claude API with profile-specific, time-aware system prompt.
+
+    time_context should contain:
+        minutes_to_close: int
+        session_phase: str (EARLY/MIDDAY/LATE/FINAL_HOUR/EXPIRY_HOUR/CLOSED)
+        current_time_ist: str
+        is_expiry_day: bool
+    """
     import streamlit as st
 
     api_key = ""
@@ -896,7 +1000,7 @@ def get_ai_analysis(
     if not api_key:
         return {"error": "Anthropic API key not set. Go to sidebar → 🤖 AI Settings → paste key."}
 
-    system_prompt = build_system_prompt(profile_name)
+    system_prompt = build_system_prompt(profile_name, time_context=time_context)
 
     MAX_CTX = 60000
     ctx = market_context[:MAX_CTX] + ("\n[Context trimmed]" if len(market_context) > MAX_CTX else "")
