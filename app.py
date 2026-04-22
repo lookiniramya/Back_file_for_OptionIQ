@@ -179,55 +179,136 @@ def _news_is_stale(max_age_minutes=10):
 def _compute_ai_time_context(mkt: dict, selected_expiry: str | None = None) -> dict:
     """Build the time-awareness dict that the AI prompt uses to scale targets
     and holding period to what's actually achievable before market close."""
-    from datetime import datetime as _dt, time as _t
+    from datetime import datetime as _dt
     now = _dt.now()
     is_open = bool(mkt.get("is_open"))
-    today_str = mkt.get("current_date", now.strftime("%d-%b-%Y"))
 
-    # Minutes until NSE close (15:30 IST)
-    close_time = now.replace(hour=15, minute=30, second=0, microsecond=0)
-    mtc = 0
-    if is_open and now < close_time:
-        mtc = int((close_time - now).total_seconds() // 60)
+    # Minutes until NSE close (15:30 IST) — ZERO when market is closed.
+    # Do NOT calculate "minutes to next open" here — that gives 300-400 min
+    # and causes the AI to act as if it has a full session ahead.
+    if not is_open:
+        mtc = 0
+    else:
+        close_time = now.replace(hour=15, minute=30, second=0, microsecond=0)
+        mtc = max(0, int((close_time - now).total_seconds() // 60))
 
-    # Session phase
+    # Session phase — finer granularity than before
     if not is_open:
         phase = "CLOSED"
-    elif mtc <= 15:
-        phase = "FINAL_MINUTES"
-    elif mtc <= 45:
-        phase = "LAST_HOUR"
-    elif mtc <= 120:
-        phase = "LATE_SESSION"
+    elif now.hour < 10:
+        phase = "EARLY_SESSION"          # 9:15 – 10:00: high volatility
     elif now.hour < 11:
-        phase = "EARLY_SESSION"
+        phase = "OPENING_HOUR"           # 10:00 – 11:00: settling down
+    elif now.hour < 13:
+        phase = "MIDDAY"                 # 11:00 – 13:00: lower volatility
+    elif now.hour < 14:
+        phase = "AFTERNOON"              # 13:00 – 14:00: pick-up begins
+    elif now.hour == 14 or (now.hour == 15 and now.minute < 0):
+        phase = "LATE_SESSION"           # 14:00 – 15:00: trend extension
+    elif mtc <= 30:
+        phase = "FINAL_30_MIN"           # 15:00 – 15:30: theta crunch
     else:
-        phase = "MIDDAY"
+        phase = "LAST_HOUR"
 
-    # Is today an expiry day? Check if selected expiry matches today
+    # Is today an expiry day? Match selected_expiry date to today
+    today_str = mkt.get("current_date", now.strftime("%d-%b-%Y"))
     is_expiry_day = False
     if selected_expiry:
         try:
-            # selected_expiry format is typically "28-04-2026" or "28-Apr-2026"
-            se = str(selected_expiry).strip().lower().replace("-", " ")
-            td = today_str.strip().lower().replace("-", " ")
-            # crude match — if the day and month-year match up
-            is_expiry_day = (se.split()[0] == td.split()[0] and
-                             se.split()[-1] == td.split()[-1])
+            import re as _re
+            # Extract day number from both dates
+            exp_day = _re.findall(r"\d+", str(selected_expiry))[0]
+            today_day = _re.findall(r"\d+", today_str)[0]
+            # Also check month/year match roughly
+            is_expiry_day = exp_day == today_day and str(now.year) in str(selected_expiry)
         except Exception:
             pass
 
+    # Typical NIFTY point range per timeframe at this time of day
+    # Used to calibrate realistic target expectations
+    if phase in ("EARLY_SESSION", "OPENING_HOUR"):
+        typical_30min_range = 80    # high morning volatility
+        typical_15min_range = 50
+    elif phase == "MIDDAY":
+        typical_30min_range = 40    # quiet midday
+        typical_15min_range = 25
+    elif phase in ("AFTERNOON", "LATE_SESSION"):
+        typical_30min_range = 55    # afternoon trend
+        typical_15min_range = 35
+    else:  # FINAL_30_MIN
+        typical_30min_range = min(mtc * 1.5, 45)  # scale to remaining time
+        typical_15min_range = min(mtc * 0.8, 30)
+
     return {
-        "minutes_to_close":  mtc,
-        "session_phase":     phase,
-        "current_time_ist":  now.strftime("%H:%M IST"),
-        "current_date":      today_str,
-        "is_expiry_day":     is_expiry_day,
-        "is_open":           is_open,
+        "minutes_to_close":       mtc,
+        "session_phase":          phase,
+        "current_time_ist":       now.strftime("%H:%M IST"),
+        "current_date":           today_str,
+        "is_expiry_day":          is_expiry_day,
+        "is_open":                is_open,
+        "typical_30min_pts":      int(typical_30min_range),
+        "typical_15min_pts":      int(typical_15min_range),
+        "max_hold_minutes":       min(mtc - 2, 60) if is_open and mtc > 5 else 0,
     }
 
 
-def _get_live_price_with_ws_fallback(token, symbol, option_data):
+def _compute_vwap_and_stats() -> dict:
+    """Compute VWAP and candle range stats from tick history.
+    VWAP = sum(price * volume) / sum(volume), approximated from ticks.
+    Also returns ATR-style avg range of last 5 candles."""
+    tick_history = st.session_state.get("tick_history", [])
+    result = {"vwap": 0.0, "avg_range_5m": 0.0, "avg_range_1m": 0.0,
+              "session_high": 0.0, "session_low": 0.0,
+              "opening_range_high": 0.0, "opening_range_low": 0.0,
+              "price_vs_vwap": "N/A"}
+    if not tick_history or len(tick_history) < 5:
+        return result
+    try:
+        df = pd.DataFrame(tick_history)
+        df["timestamp"] = pd.to_datetime(df["timestamp"], errors="coerce")
+        df["ltp"] = pd.to_numeric(df["ltp"], errors="coerce")
+        df["volume"] = pd.to_numeric(df.get("volume", 0), errors="coerce").fillna(0)
+        df = df.dropna(subset=["timestamp", "ltp"]).sort_values("timestamp")
+        if df.empty:
+            return result
+
+        # Session high/low
+        result["session_high"] = float(df["ltp"].max())
+        result["session_low"] = float(df["ltp"].min())
+
+        # VWAP (volume-weighted, fallback to simple mean if volume=0)
+        total_vol = df["volume"].sum()
+        if total_vol > 0:
+            vwap = (df["ltp"] * df["volume"]).sum() / total_vol
+        else:
+            vwap = df["ltp"].mean()
+        result["vwap"] = round(float(vwap), 2)
+
+        # Current price vs VWAP
+        cur = float(df["ltp"].iloc[-1])
+        if vwap > 0:
+            diff = cur - vwap
+            pct = (diff / vwap) * 100
+            result["price_vs_vwap"] = f"{'above' if diff > 0 else 'below'} VWAP by {abs(diff):.1f} pts ({abs(pct):.2f}%)"
+
+        # Opening range (first 15 min)
+        start = df["timestamp"].iloc[0]
+        or_end = start + pd.Timedelta(minutes=15)
+        or_df = df[df["timestamp"] <= or_end]
+        if not or_df.empty:
+            result["opening_range_high"] = float(or_df["ltp"].max())
+            result["opening_range_low"] = float(or_df["ltp"].min())
+
+        # Avg candle range from 5-min and 1-min candles
+        for tf, key in [(5, "avg_range_5m"), (1, "avg_range_1m")]:
+            candles_tf = df.set_index("timestamp")["ltp"].resample(f"{tf}min").ohlc().dropna()
+            if not candles_tf.empty:
+                recent = candles_tf.tail(8)
+                ranges = (recent["high"] - recent["low"])
+                result[key] = round(float(ranges.mean()), 1)
+    except Exception:
+        pass
+    return result
     feed = get_feed()
     if (
         st.session_state.get("ws_enabled")
@@ -1874,18 +1955,48 @@ def page_dashboard():
                         pass
                 if _extra:
                     context += "\n" + "\n".join(_extra)
-                # Add market context note WITH time-to-close awareness
+                # Add market context note WITH time-to-close and VWAP/candle stats
                 _tc = _compute_ai_time_context(mkt, st.session_state.get("selected_expiry"))
+                _vs = _compute_vwap_and_stats()
+
                 mkt_note = (
                     f"Market Status: {mkt['status']} as of {mkt['current_ist']}. "
-                    f"Minutes until 15:30 IST close: {_tc['minutes_to_close']}. "
-                    f"Session phase: {_tc['session_phase']}."
+                    f"Minutes until 15:30 IST close: {_tc['minutes_to_close']} "
+                    f"({'MARKET CLOSED — pre-market plan only' if not _tc['is_open'] else 'session active'}). "
+                    f"Session phase: {_tc['session_phase']}. "
+                    f"Max holding allowed: {_tc['max_hold_minutes']} minutes.\n"
                 )
                 if not mkt['is_open']:
-                    mkt_note += f" Data is from last trading session ({mkt['last_trading_day']})."
+                    mkt_note += f"Data is from last trading session ({mkt['last_trading_day']}). "
+                    mkt_note += "DO NOT suggest intraday targets — this is pre-market planning only.\n"
                 if _tc['is_expiry_day']:
-                    mkt_note += " ⚠️ TODAY IS EXPIRY DAY for the selected strike."
-                full_note = mkt_note + ("\n" + user_note if user_note else "")
+                    mkt_note += "EXPIRY DAY: Today is expiry — extreme theta decay on OTM options.\n"
+
+                # VWAP + candle stats — hard numbers for target calibration
+                vwap_note = ""
+                if _vs["vwap"] > 0:
+                    vwap_note += (
+                        f"\nINTRADAY PRICE STATS (for target calibration):\n"
+                        f"VWAP:                  ₹{_vs['vwap']:,.2f}\n"
+                        f"Price vs VWAP:         {_vs['price_vs_vwap']}\n"
+                        f"Session High/Low:      ₹{_vs['session_high']:,.0f} / ₹{_vs['session_low']:,.0f}\n"
+                        f"Opening Range High:    ₹{_vs['opening_range_high']:,.0f}\n"
+                        f"Opening Range Low:     ₹{_vs['opening_range_low']:,.0f}\n"
+                        f"Avg 5-min candle range (last 8 candles): {_vs['avg_range_5m']:.1f} pts\n"
+                        f"Avg 1-min candle range (last 8 candles): {_vs['avg_range_1m']:.1f} pts\n"
+                        f"Typical 30-min range at this session phase: {_tc['typical_30min_pts']} pts\n"
+                        f"Typical 15-min range at this session phase: {_tc['typical_15min_pts']} pts\n"
+                        f"\n⚡ TARGET CALIBRATION RULE: "
+                        f"T1 index move MUST be ≤ {_tc['typical_15min_pts']} pts "
+                        f"(15-min range at {_tc['session_phase']}). "
+                        f"T2 index move MUST be ≤ {_tc['typical_30min_pts']} pts "
+                        f"(30-min range). Both targets MUST complete before 15:30 IST. "
+                        f"Recent 5-min avg range is {_vs['avg_range_5m']:.1f} pts — "
+                        f"if T1 requires more than 2× this, T1 is unrealistic.\n"
+                    )
+
+                full_note = mkt_note + vwap_note + ("\n" + user_note if user_note else "")
+
                 with st.spinner(f"🧠 AI analyzing... ({_tc['minutes_to_close']} min to close)"):
                     result = get_ai_analysis(
                         context,
@@ -2063,6 +2174,7 @@ def _render_ai_result(result: dict, symbol: str, atm: float):
 
     # Extract all fields safely
     action        = ss(result.get("action"),            "NO TRADE")
+    no_trade_rsn  = ss(result.get("no_trade_reason"),   "")
     conf          = max(0, min(100, int(sf(result.get("confidence"), 0))))
     win_rate      = max(0, min(100, int(sf(result.get("estimated_win_rate"), conf))))
     profile_used  = ss(result.get("risk_profile"),      st.session_state.risk_profile)
@@ -2110,6 +2222,35 @@ def _render_ai_result(result: dict, symbol: str, atm: float):
     mkt_now = st.session_state.get("market_status", {})
     if mkt_now and not mkt_now.get("is_open", True) and action != "NO TRADE":
         st.markdown(f"""<div style="background:#fff8e1;border:1px solid #ffe082;border-left:4px solid #f57f17;border-radius:8px;padding:10px 16px;margin-bottom:12px;display:flex;align-items:center;gap:10px"><span style="font-size:1.2rem">🌙</span><div><div style="font-weight:700;color:#7f5a00">PRE-MARKET PLAN — For Next Trading Session</div><div style="font-size:.82rem;color:#9e6c00">Market is closed. Verify all cues at 9:15 AM open. Do NOT use today's expiry strikes.</div></div></div>""", unsafe_allow_html=True)
+
+    # Stale recommendation warning — if generated > 15 min ago and market is open
+    ai_ts = st.session_state.get("ai_result_timestamp")
+    if ai_ts and mkt_now and mkt_now.get("is_open"):
+        age_min = (datetime.now() - ai_ts).total_seconds() / 60
+        if age_min > 15:
+            st.warning(
+                f"⚠️ **This recommendation is {int(age_min)}m old.** "
+                f"Market conditions may have changed — regenerate before entering any trade.",
+                icon="🕐",
+            )
+
+    # NO TRADE — show a clear explanation instead of a blank trade card
+    if action == "NO TRADE":
+        st.markdown(f"""
+        <div style="background:#f3f4fb;border:2px solid #5566cc;border-radius:14px;
+                    padding:1.5rem;text-align:center;margin-bottom:1rem">
+            <div style="font-size:2rem">🚫</div>
+            <div style="font-size:1.4rem;font-weight:700;color:#3949ab;margin:0.5rem 0">
+                NO TRADE
+            </div>
+            {f'<div style="font-size:0.9rem;color:#546e7a;margin-top:0.5rem;max-width:600px;margin:auto">{no_trade_rsn}</div>' if no_trade_rsn else ''}
+            <div style="font-size:0.78rem;color:#78909c;margin-top:0.8rem">
+                Confidence: {conf}/100 &nbsp;|&nbsp; Timeframe: {timeframe}
+            </div>
+        </div>""", unsafe_allow_html=True)
+        if trade_plan and trade_plan != "—":
+            st.info(f"**When conditions improve:** {trade_plan}", icon="📋")
+        return   # Don't render the full trade card for NO TRADE
 
     # AI generation timestamp + age (pinned indicator so users know the
     # recommendation survives auto-refresh).

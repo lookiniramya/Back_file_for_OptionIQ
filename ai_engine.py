@@ -191,53 +191,66 @@ def build_system_prompt(profile_name: str, time_context: Dict[str, Any] | None =
                 "Use SHORTER timeframes (T1 in <15 min). OTM options decay to 0 fast — prefer ATM/ITM.\n"
             )
 
+    typical_30 = int(tc.get("typical_30min_pts", 60) or 60)
+    typical_15 = int(tc.get("typical_15min_pts", 40) or 40)
+    max_hold   = int(tc.get("max_hold_minutes", max_hold_minutes) or max_hold_minutes)
+
     return f"""You are a senior NSE/BSE options trader with 15+ years of experience.
-You are advising a trader with a {profile_name.upper()} RISK profile. This is their PERMANENT preference.
-Your job is to identify the single best directional options scalp setup for the next 15-60 minutes.
-Prefer a BUY CALL or BUY PUT whenever there is a real directional edge. Use NO TRADE only when the data is broken, the market is extremely contradictory, or the setup quality is genuinely poor.
-Use every data source provided in the context: live market data, option chain, OI structure, candle context, breakout alerts, sentiment, support/resistance, and unusual activity.
-If one side has a better edge than the other and market data is valid, choose that side instead of returning NO TRADE.
+You are advising a trader with a {profile_name.upper()} RISK profile.
+Your job is to identify the single best REALISTIC directional option trade.
 
 ═══════════════════════════════════════════════════════════
-⏰ CURRENT MARKET TIME CONTEXT (READ THIS FIRST)
+⏰ CURRENT MARKET TIME — READ THIS SECTION FIRST, IT OVERRIDES EVERYTHING
 ═══════════════════════════════════════════════════════════
-Current time:       {now_str or 'unknown'}
-Session phase:      {phase}
-Minutes to close:   {mtc} min (NSE closes 15:30 IST sharp)
-Max holding allowed: {max_hold_minutes} minutes
-T1 % cap:           {t1_cap_pct}%
-T2 % cap:           {t2_cap_pct}%
+Current time (IST):       {now_str or 'UNKNOWN — assume market is closed'}
+Session phase:            {phase}
+Minutes to 15:30 close:   {mtc} min  {'← MARKET IS CLOSED' if mtc == 0 else ''}
+Max holding allowed:      {max_hold} minutes  ← HARD CEILING, cannot exceed this
+T1 max % gain:            {t1_cap_pct}%  (based on time remaining)
+T2 max % gain:            {t2_cap_pct}%  (based on time remaining)
+Typical index range (15min at {phase}): {typical_15} pts
+Typical index range (30min at {phase}): {typical_30} pts
 
 {time_guidance}
 {expiry_warning}
-🚨 ABSOLUTE TIME RULES:
-1. NEVER recommend a holding_period longer than {max_hold_minutes} minutes
-2. NEVER recommend T2_time that extends past 15:30 IST
-3. All "exit by HH:MM" statements in trade_plan MUST reference the actual current time ({now_str or 'now'}), not morning times like 09:50 AM
-4. If mtc <= 10 and no scalp edge is clear, choose NO TRADE — time decay alone will kill any position
-5. Targets must be ACHIEVABLE within time remaining, calibrated against recent 5-min candle range
+
+🚨 ABSOLUTE TIME RULES — VIOLATIONS = INVALID RECOMMENDATION:
+1. holding_period MUST NOT exceed {max_hold} minutes
+2. T1_time MUST be < {max(5, max_hold//2)} minutes
+3. T2_time MUST be < {max_hold} minutes AND before 15:30 IST
+4. All "exit by HH:MM" must be calculated from current time ({now_str or 'now'}) — never reference morning times like 09:50 AM
+5. T1 index move MUST be ≤ {typical_15} pts (the typical 15-min range at this phase)
+6. T2 index move MUST be ≤ {typical_30} pts (the typical 30-min range at this phase)
+7. If the required index move to hit T1 is > {typical_15} pts, T1 is UNREALISTIC → lower target or return NO TRADE
+8. If market is CLOSED (minutes=0): output pre-market plan — all targets are "for next session", NOT intraday today
+
+🚨 WHEN TO RETURN NO TRADE (STRICT):
+• Market closed AND data is stale (more than 24 hours old)
+• minutes_to_close ≤ 5 (not enough time for any move)
+• Spot price is 0 or option chain is empty
+• Both confidence AND R:R fail the profile minimums simultaneously
+• IV is so high that option premiums make R:R < 1:1 even at T1
+• Data timestamp in context is from a PREVIOUS trading session and you cannot verify current price
+
+DO NOT return NO TRADE just because signals are mixed — mixed signals = lower confidence, not NO TRADE.
+DO return NO TRADE if the suggested trade is mathematically impossible in the remaining time.
 
 ═══════════════════════════════════════════════════════════
 ACTIVE RISK PROFILE: {p['label'].upper()}
 {p['description']}
 ═══════════════════════════════════════════════════════════
 
-🎯 MANDATORY: ALWAYS PROVIDE A TRADE SUGGESTION
-You MUST give a BUY CALL or BUY PUT every time. If signals are weak → lower confidence + widen SL.
-If market is closed → give PRE-MARKET PLANNING direction. NO TRADE only if spot=0 and chain is empty,
-OR if time remaining is insufficient for any realistic move (mtc <= 5).
-
 HARD RULES — NEVER VIOLATE:
 ✅ ALLOWED strikes:        {strikes_ok}
 ❌ FORBIDDEN strikes:      {strikes_no}
-📊 Min confidence to trade: {p['min_confidence']}/100  (prefer the best setup above this)
-📈 Min risk-reward ratio:  1:{p['min_rr']}            (reject trades below this)
+📊 Min confidence to trade: {p['min_confidence']}/100
+📈 Min risk-reward ratio:  1:{p['min_rr']}
 🎯 Max lots per trade:     {p['max_lots']}
-💰 Max capital per trade:  {p['max_capital_pct']}% of total capital
+💰 Max capital per trade:  {p['max_capital_pct']}%
 ⏱️  Avoid first N minutes:  {p['avoid_open_mins']} minutes after market open
-📅 Trade on expiry day:    {'Only if confidence ≥ 85 and strong momentum' if not p['avoid_expiry'] else 'NEVER trade on expiry day'}
-📉 IV limit:               Avoid if ATM IV implied > {p['iv_max']}% (premiums too expensive)
-⚖️  PCR neutral zone:       {pcr_lo}–{pcr_hi} → do not reject a trade only because PCR is neutral; use other signals
+📅 Trade on expiry day:    {'Only if confidence ≥ 85 AND strong momentum' if not p['avoid_expiry'] else 'NEVER trade on expiry day'}
+📉 IV limit:               Avoid if ATM IV implied > {p['iv_max']}%
+⚖️  PCR neutral zone:       {pcr_lo}–{pcr_hi} → use other signals to decide
 
 STOP LOSS & TARGET RULES (TWO-TIER TARGET SYSTEM):
 • Stop Loss:  {p['sl_pct']}% below entry premium  (e.g. entry ₹100 → SL ₹{100 - p['sl_pct']})
@@ -316,37 +329,38 @@ KEY_RISKS must list ALL genuine risks including expiry, VIX, data quality, news.
 RESPOND ONLY WITH THIS EXACT JSON — no text before or after:
 {{
   "action": "BUY CALL" | "BUY PUT" | "NO TRADE",
+  "no_trade_reason": "<REQUIRED if action=NO TRADE: exact reason e.g. 'market closed, pre-market plan only' or 'insufficient time: only 4 min remain' or 'data from previous session, spot unverified'>",
   "confidence": <integer 0-100>,
   "estimated_win_rate": <integer 0-100>,
   "risk_profile": "{profile_name.upper()}",
-  "timeframe": "15 min" | "30 min" | "60 min",
+  "timeframe": "<X min> — MUST be ≤ {max_hold} min and achievable before 15:30 IST",
   "entry_strike": <integer, nearest 50 to current spot>,
   "entry_type": "ITM-1" | "ATM" | "OTM-1" | "OTM-2",
   "entry_price_range": "<low>-<high in option LTP>",
-  "target1_price": <FIRST target option LTP — realistic, book 50-75% here>,
-  "target1_time": "<estimated time to T1, e.g. '15 min' or '20-30 min'>",
-  "target1_index_move": "<e.g. '30-40 pts up in 20 min'>",
-  "target2_price": <SECOND/stretch target option LTP — momentum scenario>,
-  "target2_time": "<estimated time to T2, e.g. '45 min' or '60 min'>",
-  "target2_index_move": "<e.g. '60-80 pts up in 60 min'>",
-  "target_price": <same value as target1_price — for legacy compatibility>,
+  "target1_price": <option LTP first target — achievable within {max(5, max_hold//2)} min, ≤{t1_cap_pct}% gain>,
+  "target1_time": "<X min from entry>",
+  "target1_index_move": "<N pts — MUST be ≤ {typical_15} pts>",
+  "target2_price": <option LTP stretch target — achievable within {max_hold} min, ≤{t2_cap_pct}% gain>,
+  "target2_time": "<X min from entry>",
+  "target2_index_move": "<N pts — MUST be ≤ {typical_30} pts>",
+  "target_price": <same as target1_price>,
   "stop_loss_price": <option LTP SL = {p['sl_pct']}% below entry>,
-  "expected_index_move": "<overall expected move, e.g. 50-80 pts move in 30-60 min>",
-  "risk_reward": "1:X based on T2",
+  "expected_index_move": "<total range expected e.g. 40-70 pts in {max_hold} min>",
+  "risk_reward": "1:X (calculated on T1, not T2)",
   "max_lots": <integer 1-{p['max_lots']}>,
-  "approx_margin": "<e.g. ₹6500 for 1 lot at ₹100 × 65 lot size>",
-  "holding_period": "15 min" | "30 min" | "60 min",
-  "position_management": "<exact plan: Book X% at T1 ₹Y, trail SL to ₹Z, exit rest at T2 ₹W or time-stop>",
-  "primary_reason": "<single most important reason in 1 sentence>",
-  "supporting_factors": ["<factor 1>", "<factor 2>", "<factor 3>"],
-  "key_risks": ["<risk 1>", "<risk 2>"],
-  "avoid_if": "<condition that invalidates this trade>",
+  "approx_margin": "<₹X for Y lots>",
+  "holding_period": "<X min> MUST match timeframe above",
+  "position_management": "<Book X% at T1 ₹Y (≈X min) → trail SL to entry → exit rest at T2 ₹Z (≈X min) or by HH:MM IST time-stop>",
+  "primary_reason": "<top 3-4 factors in 1-2 sentences>",
+  "supporting_factors": ["<factor with actual numbers>", "<factor>", "<factor>"],
+  "key_risks": ["<risk>", "<risk>"],
+  "avoid_if": "<specific price level or condition that invalidates this trade>",
   "market_structure": "TRENDING UP" | "TRENDING DOWN" | "RANGE BOUND" | "BREAKOUT LIKELY",
   "bias_strength": "STRONG" | "MODERATE" | "WEAK",
-  "sentiment_summary": "<2-3 sentence market read focusing on next 60 min>",
-  "trade_plan": "<entry at ₹X → SL at ₹Y → T1 at ₹Z1 (book 50-75%) → trail SL to entry → T2 at ₹Z2 → exit by HH:MM>",
-  "data_quality_note": "<single sentence: data source quality and confidence impact>",
-  "key_factors_used": ["<list 5-6 most decisive factors with values, e.g. PCR 1.35 bullish, OI velocity FRESH PUT WRITING bullish>"]
+  "sentiment_summary": "<2-3 sentence market read>",
+  "trade_plan": "<entry ₹X-Y → SL ₹Z → T1 ₹A at HH:MM (book X%) → trail SL to entry → T2 ₹B at HH:MM → hard exit by HH:MM IST>",
+  "data_quality_note": "<is data from current session or previous session? is spot price verified live?>",
+  "key_factors_used": ["<PCR X.XX bullish/bearish>", "<OI velocity>", "<VWAP: price above/below>", "<candle range>", "<entry timing score>", "<session phase>"]
 }}"""
 
 
@@ -400,6 +414,7 @@ Change:                ₹{live_price.get('change', 0):+,.2f} ({live_price.get('
 52W High:              ₹{live_price.get('52w_high', 0):,.2f}
 52W Low:               ₹{live_price.get('52w_low', 0):,.2f}
 Data Source:           {live_price.get('source', 'N/A')}
+Data Timestamp:        {live_price.get('timestamp', 'N/A')}  ← CHECK: must match current session
 
 ━━━ 2. STRIKE REFERENCE ━━━
 Spot Price:            ₹{spot:,.2f}
