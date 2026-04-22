@@ -1146,6 +1146,15 @@ def _render_intelligence(fii_dii, global_cues, india_vix, mkt_breadth, news_item
             <span style="color:{gc};font-weight:700">Global: {gsent}</span>
             <span style="color:#1565c0">🎯 {global_cues.get("gift_nifty_signal","N/A")}</span></div>
         <div style="font-size:.7rem;color:#78909c;margin-bottom:6px">GIFT Nifty source: {global_cues.get("gift_nifty_source","Unknown")}</div>''', unsafe_allow_html=True)
+
+        # Warn if GIFT fell back to Nifty 50 spot (value will equal NIFTY)
+        _gift_entry = gdata.get("GIFT Nifty", {})
+        if not _gift_entry.get("is_real_gift") and _gift_entry.get("price", 0) > 0:
+            st.caption(
+                "⚠️ GIFT Nifty data unavailable — showing Nifty 50 spot as proxy. "
+                "This value is NOT a leading pre-market indicator. "
+                "Check investing.com/indices/sgx-nifty-50-futures for actual GIFT Nifty."
+            )
         cols = st.columns(4)
         for i, name in enumerate(["GIFT Nifty","Dow Jones","Nasdaq","S&P 500","Nikkei 225","Hang Seng","DAX","FTSE 100","Crude Oil","Gold","USD/INR","India VIX"]):
             d = gdata.get(name, {}); p = d.get("price", 0); chg = d.get("chg_pct", 0)

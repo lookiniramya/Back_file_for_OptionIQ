@@ -201,9 +201,20 @@ def fetch_fii_dii(force: bool = False) -> Dict[str, Any]:
 
 def fetch_gift_nifty(force: bool = False) -> Dict[str, Any]:
     """
-    Real GIFT Nifty futures price from NSE IX (IFSC).
-    Primary: NSE International Exchange API
-    Fallback: Yahoo Finance ^NSEI (Nifty 50 proxy, 15-min delay)
+    Fetch live GIFT Nifty price.
+
+    GIFT Nifty is a separate futures contract traded on NSE IX (GIFT City)
+    that tracks Nifty 50 but has its own price discovery — especially during
+    non-NSE hours (before 9:15 AM and after 3:30 PM IST). That pre-market
+    value is what makes it a useful leading indicator.
+
+    Sources tried in order:
+      1. investing.com — public quote page for GIFT Nifty (most reliable)
+      2. Yahoo NIFTY Futures (NIFTY_F1.NS) — domestic futures, close proxy
+      3. Yahoo ^NSEI — Nifty 50 SPOT (clearly labelled as not-GIFT fallback)
+
+    If we end up at source 3, the UI will show a warning that the value is
+    the Nifty 50 spot, not actual GIFT Nifty.
     """
     key = "gift_nifty"
     if not force and _fresh(key, 120):
@@ -213,66 +224,87 @@ def fetch_gift_nifty(force: bool = False) -> Dict[str, Any]:
         "price": 0.0, "change": 0.0, "chg_pct": 0.0,
         "open": 0.0, "high": 0.0, "low": 0.0, "prev_close": 0.0,
         "source": "Unknown", "signal": "❓", "error": None,
+        "is_real_gift": False,   # Flag so UI knows whether value is true GIFT
     }
 
-    # ── Source 1: NSE IFSC / NSE IX official feed ─────────────────────────
-    nseix_endpoints = [
-        "https://www.nseix.com/api/indices/NIFTY50",
-        "https://www.nseindia.com/api/quote-derivative?symbol=NIFTY&identifier=OPTIDXNIFTY",
-    ]
+    # ── Source 1: investing.com GIFT Nifty quote page ─────────────────────
+    # investing.com publishes GIFT Nifty futures at a stable URL. We parse
+    # the embedded JSON / numeric values from the HTML.
     try:
-        # Try NSE's own GIFT Nifty index quote
+        import re as _re
         r = requests.get(
-            "https://www.nseindia.com/api/allIndices",
-            headers=_NSE_H, timeout=8
+            "https://www.investing.com/indices/sgx-nifty-50-futures",
+            headers={
+                "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                              "AppleWebKit/537.36 (KHTML, like Gecko) "
+                              "Chrome/120.0.0.0 Safari/537.36",
+                "Accept": "text/html,application/xhtml+xml",
+                "Accept-Language": "en-US,en;q=0.9",
+            },
+            timeout=8,
         )
         if r.status_code == 200:
-            for idx in r.json().get("data", []):
-                name = idx.get("index", "").upper()
-                if "GIFT" in name or "IFSC" in name or "NSE50" in name:
-                    price = _sf(idx.get("last"))
-                    prev  = _sf(idx.get("previousClose"))
-                    if price > 10000:
-                        chg  = price - prev if prev else 0
-                        chgp = (chg/prev*100) if prev else 0
-                        result.update({
-                            "price": round(price,2), "change": round(chg,2),
-                            "chg_pct": round(chgp,2), "prev_close": round(prev,2),
-                            "open": _sf(idx.get("open")), "high": _sf(idx.get("high")),
-                            "low":  _sf(idx.get("low")),
-                            "source": "NSE IFSC", "error": None,
-                        })
-                        break
-    except Exception as e:
-        result["error"] = f"NSE IFSC: {e}"
-
-    # ── Source 2: Yahoo Finance (Nifty 50 proxy — clearly labelled) ────────
-    if result["price"] == 0:
-        try:
-            r = requests.get(
-                "https://query1.finance.yahoo.com/v8/finance/chart/^NSEI",
-                params={"interval":"1m","range":"1d"},
-                headers={"User-Agent":"Mozilla/5.0"}, timeout=6
-            )
-            if r.status_code == 200:
-                meta = r.json().get("chart",{}).get("result",[{}])[0].get("meta",{})
-                price = _sf(meta.get("regularMarketPrice"))
-                prev  = _sf(meta.get("previousClose") or meta.get("chartPreviousClose"))
-                if price > 10000:
-                    chg  = price - prev if prev else 0
-                    chgp = (chg/prev*100) if prev else 0
+            html = r.text
+            # investing.com wraps the price in data-test attributes
+            price_m = _re.search(r'data-test="instrument-price-last"[^>]*>([\d,]+\.\d+)', html)
+            change_m = _re.search(r'data-test="instrument-price-change"[^>]*>([+\-]?[\d,]+\.\d+)', html)
+            chgp_m = _re.search(r'data-test="instrument-price-change-percent"[^>]*>\(([+\-]?[\d.]+)%\)', html)
+            if price_m:
+                price = float(price_m.group(1).replace(",", ""))
+                if price > 10000:  # sanity check
+                    chg = float(change_m.group(1).replace(",", "")) if change_m else 0.0
+                    chgp = float(chgp_m.group(1)) if chgp_m else (
+                        (chg / (price - chg) * 100) if (price - chg) != 0 else 0.0
+                    )
                     result.update({
-                        "price": round(price,2), "change": round(chg,2),
-                        "chg_pct": round(chgp,2), "prev_close": round(prev,2),
-                        "open":  round(_sf(meta.get("regularMarketOpen")),2),
-                        "high":  round(_sf(meta.get("regularMarketDayHigh")),2),
-                        "low":   round(_sf(meta.get("regularMarketDayLow")),2),
-                        "source": "Yahoo (Nifty 50 proxy — GIFT unavailable)",
+                        "price": round(price, 2),
+                        "change": round(chg, 2),
+                        "chg_pct": round(chgp, 2),
+                        "prev_close": round(price - chg, 2),
+                        "source": "investing.com (GIFT Nifty Futures)",
+                        "is_real_gift": True,
                         "error": None,
                     })
-        except Exception as e:
-            if not result.get("error"):
-                result["error"] = f"Yahoo: {e}"
+    except Exception as e:
+        result["error"] = f"investing.com: {e}"
+
+    # ── Source 2: Yahoo NIFTY Futures (domestic F&O) ──────────────────────
+    # Not GIFT Nifty itself but the nearest traded futures contract —
+    # usually tracks GIFT closely and provides a meaningful pre-market signal.
+    if result["price"] == 0:
+        for sym in ["NIFTY_F1.NS", "^NSEI"]:  # try futures first, then spot
+            try:
+                r = requests.get(
+                    f"https://query1.finance.yahoo.com/v8/finance/chart/{sym}",
+                    params={"interval": "1m", "range": "1d"},
+                    headers={"User-Agent": "Mozilla/5.0"}, timeout=6,
+                )
+                if r.status_code != 200:
+                    continue
+                meta = r.json().get("chart", {}).get("result", [{}])[0].get("meta", {})
+                price = _sf(meta.get("regularMarketPrice"))
+                prev = _sf(meta.get("previousClose") or meta.get("chartPreviousClose"))
+                if price > 10000:
+                    chg = price - prev if prev else 0
+                    chgp = (chg / prev * 100) if prev else 0
+                    is_real = (sym == "NIFTY_F1.NS")
+                    result.update({
+                        "price": round(price, 2),
+                        "change": round(chg, 2),
+                        "chg_pct": round(chgp, 2),
+                        "prev_close": round(prev, 2),
+                        "open": round(_sf(meta.get("regularMarketOpen")), 2),
+                        "high": round(_sf(meta.get("regularMarketDayHigh")), 2),
+                        "low": round(_sf(meta.get("regularMarketDayLow")), 2),
+                        "source": ("Yahoo NIFTY Futures (proxy — not actual GIFT)" if is_real
+                                   else "⚠️ Yahoo Nifty 50 SPOT (GIFT unavailable — not a true pre-market indicator)"),
+                        "is_real_gift": False,  # Neither source is true GIFT Nifty
+                        "error": None,
+                    })
+                    break
+            except Exception as e:
+                if not result.get("error"):
+                    result["error"] = f"Yahoo {sym}: {e}"
 
     chgp = result["chg_pct"]
     if result["price"] > 0:
@@ -331,6 +363,7 @@ def fetch_global_cues(force: bool = False) -> Dict[str, Any]:
         "chg_pct": gift["chg_pct"],
         "signal": "🟢" if gift["chg_pct"]>0.2 else "🔴" if gift["chg_pct"]<-0.2 else "⚖️",
         "source": gift["source"],
+        "is_real_gift": gift.get("is_real_gift", False),
     }
     for name, sym in _YF.items():
         result["data"][name] = _yf(sym)
@@ -572,6 +605,7 @@ DII Net: ₹{fii_dii.get('dii_net',0):+,.0f} Cr  Buy: ₹{fii_dii.get('dii_buy',
 ━━━ GIFT NIFTY (source: {gift.get('source','N/A')}) ━━━
 Price: {gift.get('price',0):,.2f}  ({gift.get('chg_pct',0):+.2f}%)  {gift.get('signal','')}
 Signal: {global_cues.get('gift_nifty_signal','N/A')}
+{'⚠️ NOTE: Value is a PROXY (Nifty 50 spot) — do not treat as a leading pre-market indicator.' if not gift.get('is_real_gift') else '✓ Genuine GIFT Nifty futures value — use as pre-market signal.'}
 
 ━━━ GLOBAL CUES ━━━
 Dow: {dow.get('price',0):,.0f} ({dow.get('chg_pct',0):+.2f}%)  Nasdaq: {nas.get('price',0):,.0f} ({nas.get('chg_pct',0):+.2f}%)
