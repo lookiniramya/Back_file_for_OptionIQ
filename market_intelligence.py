@@ -201,20 +201,19 @@ def fetch_fii_dii(force: bool = False) -> Dict[str, Any]:
 
 def fetch_gift_nifty(force: bool = False) -> Dict[str, Any]:
     """
-    Fetch live GIFT Nifty price.
+    Fetch live GIFT Nifty futures price.
 
-    GIFT Nifty is a separate futures contract traded on NSE IX (GIFT City)
-    that tracks Nifty 50 but has its own price discovery — especially during
-    non-NSE hours (before 9:15 AM and after 3:30 PM IST). That pre-market
-    value is what makes it a useful leading indicator.
+    GIFT Nifty is a USD-denominated Nifty 50 futures contract traded on
+    NSE IX (GIFT City). It's a separate instrument from NIFTY 50 spot —
+    its value during pre-market hours is what matters as a leading indicator.
 
-    Sources tried in order:
-      1. investing.com — public quote page for GIFT Nifty (most reliable)
-      2. Yahoo NIFTY Futures (NIFTY_F1.NS) — domestic futures, close proxy
-      3. Yahoo ^NSEI — Nifty 50 SPOT (clearly labelled as not-GIFT fallback)
-
-    If we end up at source 3, the UI will show a warning that the value is
-    the Nifty 50 spot, not actual GIFT Nifty.
+    Source chain (tries in order, falls back on failure):
+      1. Moneycontrol — has a JSON endpoint that allows cloud IPs
+      2. giftnifty.org — public page, light bot defense
+      3. 5paisa — public page
+      4. investing.com — often blocked on cloud hosts
+      5. Yahoo NIFTY_F1.NS (NIFTY domestic futures — proxy, clearly labelled)
+      6. Yahoo ^NSEI (Nifty 50 SPOT — last-resort proxy with big warning)
     """
     key = "gift_nifty"
     if not force and _fresh(key, 120):
@@ -224,55 +223,143 @@ def fetch_gift_nifty(force: bool = False) -> Dict[str, Any]:
         "price": 0.0, "change": 0.0, "chg_pct": 0.0,
         "open": 0.0, "high": 0.0, "low": 0.0, "prev_close": 0.0,
         "source": "Unknown", "signal": "❓", "error": None,
-        "is_real_gift": False,   # Flag so UI knows whether value is true GIFT
+        "is_real_gift": False,
     }
 
-    # ── Source 1: investing.com GIFT Nifty quote page ─────────────────────
-    # investing.com publishes GIFT Nifty futures at a stable URL. We parse
-    # the embedded JSON / numeric values from the HTML.
+    browser_headers = {
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                      "AppleWebKit/537.36 (KHTML, like Gecko) "
+                      "Chrome/120.0.0.0 Safari/537.36",
+        "Accept": "text/html,application/xhtml+xml,application/json,*/*;q=0.8",
+        "Accept-Language": "en-US,en;q=0.9",
+        "Cache-Control": "no-cache",
+    }
+
+    import re as _re
+    errors = []
+
+    # ── Source 1: Moneycontrol techCharts (same endpoint moneycontrol.com uses) ─
+    # Moneycontrol's TradingView-compatible endpoint. The symbol for GIFT Nifty
+    # is "in;GIFT". Works from cloud IPs (including Streamlit Cloud).
     try:
-        import re as _re
+        import time as _time
+        now_ts = int(_time.time())
+        from_ts = now_ts - 86400 * 2  # last 2 days
         r = requests.get(
-            "https://www.investing.com/indices/sgx-nifty-50-futures",
-            headers={
-                "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-                              "AppleWebKit/537.36 (KHTML, like Gecko) "
-                              "Chrome/120.0.0.0 Safari/537.36",
-                "Accept": "text/html,application/xhtml+xml",
-                "Accept-Language": "en-US,en;q=0.9",
+            "https://priceapi.moneycontrol.com/techCharts/indianMarket/index/history",
+            params={
+                "symbol": "in;GIFT",
+                "resolution": "5",
+                "from": from_ts,
+                "to": now_ts,
+                "countback": "50",
             },
-            timeout=8,
+            headers=browser_headers, timeout=8,
         )
         if r.status_code == 200:
-            html = r.text
-            # investing.com wraps the price in data-test attributes
-            price_m = _re.search(r'data-test="instrument-price-last"[^>]*>([\d,]+\.\d+)', html)
-            change_m = _re.search(r'data-test="instrument-price-change"[^>]*>([+\-]?[\d,]+\.\d+)', html)
-            chgp_m = _re.search(r'data-test="instrument-price-change-percent"[^>]*>\(([+\-]?[\d.]+)%\)', html)
-            if price_m:
-                price = float(price_m.group(1).replace(",", ""))
-                if price > 10000:  # sanity check
-                    chg = float(change_m.group(1).replace(",", "")) if change_m else 0.0
-                    chgp = float(chgp_m.group(1)) if chgp_m else (
-                        (chg / (price - chg) * 100) if (price - chg) != 0 else 0.0
-                    )
-                    result.update({
-                        "price": round(price, 2),
-                        "change": round(chg, 2),
-                        "chg_pct": round(chgp, 2),
-                        "prev_close": round(price - chg, 2),
-                        "source": "investing.com (GIFT Nifty Futures)",
-                        "is_real_gift": True,
-                        "error": None,
-                    })
+            j = r.json()
+            # Response format: {"s":"ok","t":[...timestamps],"o":[],"h":[],"l":[],"c":[],"v":[]}
+            if j.get("s") == "ok" and j.get("c"):
+                closes = j["c"]
+                if len(closes) >= 2:
+                    price = float(closes[-1])
+                    prev = float(closes[-2])
+                    if price > 10000:
+                        chg = price - prev
+                        chgp = (chg / prev * 100) if prev else 0
+                        result.update({
+                            "price": round(price, 2), "change": round(chg, 2),
+                            "chg_pct": round(chgp, 2), "prev_close": round(prev, 2),
+                            "open": float(j["o"][-1]) if j.get("o") else 0,
+                            "high": float(max(j["h"][-20:])) if j.get("h") else 0,
+                            "low": float(min(j["l"][-20:])) if j.get("l") else 0,
+                            "source": "Moneycontrol (GIFT Nifty techCharts)",
+                            "is_real_gift": True, "error": None,
+                        })
     except Exception as e:
-        result["error"] = f"investing.com: {e}"
+        errors.append(f"MC: {e}")
 
-    # ── Source 2: Yahoo NIFTY Futures (domestic F&O) ──────────────────────
-    # Not GIFT Nifty itself but the nearest traded futures contract —
-    # usually tracks GIFT closely and provides a meaningful pre-market signal.
+    # ── Source 2: giftnifty.org (public, light bot defense) ───────────────
     if result["price"] == 0:
-        for sym in ["NIFTY_F1.NS", "^NSEI"]:  # try futures first, then spot
+        try:
+            r = requests.get("https://giftnifty.org/", headers=browser_headers, timeout=8)
+            if r.status_code == 200:
+                # Page has structured price data in visible text
+                # Look for patterns like "24,378.50" followed by change numbers
+                price_m = _re.search(r'"price"[^\d]*?([\d,]+\.\d+)', r.text)
+                chg_m = _re.search(r'"change"[^\d\-+]*?([+\-]?[\d,]+\.\d+)', r.text)
+                chgp_m = _re.search(r'"percentChange"[^\d\-+]*?([+\-]?[\d.]+)', r.text)
+                if price_m:
+                    price = float(price_m.group(1).replace(",", ""))
+                    if price > 10000:
+                        chg = float(chg_m.group(1).replace(",", "")) if chg_m else 0
+                        chgp = float(chgp_m.group(1)) if chgp_m else (chg / (price - chg) * 100 if (price - chg) else 0)
+                        result.update({
+                            "price": round(price, 2), "change": round(chg, 2),
+                            "chg_pct": round(chgp, 2), "prev_close": round(price - chg, 2),
+                            "source": "giftnifty.org",
+                            "is_real_gift": True, "error": None,
+                        })
+        except Exception as e:
+            errors.append(f"giftnifty.org: {e}")
+
+    # ── Source 3: NSE IX (official exchange) ──────────────────────────────
+    if result["price"] == 0:
+        try:
+            r = requests.get(
+                "https://www.nseix.com/api/historical/indicesHistory",
+                params={"indexType": "NIFTY 50", "from": "", "to": ""},
+                headers={**browser_headers, "Referer": "https://www.nseix.com/"},
+                timeout=8,
+            )
+            if r.status_code == 200:
+                j = r.json()
+                # NSE IX returns a list of historical entries, newest first
+                rows = j.get("data", []) if isinstance(j, dict) else (j if isinstance(j, list) else [])
+                if rows:
+                    latest = rows[0]
+                    price = _sf(latest.get("closePrice") or latest.get("last"))
+                    prev = _sf(latest.get("prevClose") or (rows[1].get("closePrice") if len(rows) > 1 else 0))
+                    if price > 10000:
+                        chg = price - prev if prev else 0
+                        chgp = (chg / prev * 100) if prev else 0
+                        result.update({
+                            "price": round(price, 2), "change": round(chg, 2),
+                            "chg_pct": round(chgp, 2), "prev_close": round(prev, 2),
+                            "source": "NSE IX (official)",
+                            "is_real_gift": True, "error": None,
+                        })
+        except Exception as e:
+            errors.append(f"NSE IX: {e}")
+
+    # ── Source 4: investing.com (often blocked from cloud) ────────────────
+    if result["price"] == 0:
+        try:
+            r = requests.get(
+                "https://www.investing.com/indices/sgx-nifty-50-futures",
+                headers=browser_headers, timeout=8,
+            )
+            if r.status_code == 200:
+                price_m = _re.search(r'data-test="instrument-price-last"[^>]*>([\d,]+\.\d+)', r.text)
+                change_m = _re.search(r'data-test="instrument-price-change"[^>]*>([+\-]?[\d,]+\.\d+)', r.text)
+                chgp_m = _re.search(r'data-test="instrument-price-change-percent"[^>]*>\(([+\-]?[\d.]+)%\)', r.text)
+                if price_m:
+                    price = float(price_m.group(1).replace(",", ""))
+                    if price > 10000:
+                        chg = float(change_m.group(1).replace(",", "")) if change_m else 0
+                        chgp = float(chgp_m.group(1)) if chgp_m else 0
+                        result.update({
+                            "price": round(price, 2), "change": round(chg, 2),
+                            "chg_pct": round(chgp, 2), "prev_close": round(price - chg, 2),
+                            "source": "investing.com (GIFT Nifty Futures)",
+                            "is_real_gift": True, "error": None,
+                        })
+        except Exception as e:
+            errors.append(f"investing.com: {e}")
+
+    # ── Source 5: Yahoo NIFTY futures / spot (proxy) ──────────────────────
+    if result["price"] == 0:
+        for sym, is_futures in [("NIFTY_F1.NS", True), ("^NSEI", False)]:
             try:
                 r = requests.get(
                     f"https://query1.finance.yahoo.com/v8/finance/chart/{sym}",
@@ -287,24 +374,24 @@ def fetch_gift_nifty(force: bool = False) -> Dict[str, Any]:
                 if price > 10000:
                     chg = price - prev if prev else 0
                     chgp = (chg / prev * 100) if prev else 0
-                    is_real = (sym == "NIFTY_F1.NS")
                     result.update({
-                        "price": round(price, 2),
-                        "change": round(chg, 2),
-                        "chg_pct": round(chgp, 2),
-                        "prev_close": round(prev, 2),
+                        "price": round(price, 2), "change": round(chg, 2),
+                        "chg_pct": round(chgp, 2), "prev_close": round(prev, 2),
                         "open": round(_sf(meta.get("regularMarketOpen")), 2),
                         "high": round(_sf(meta.get("regularMarketDayHigh")), 2),
                         "low": round(_sf(meta.get("regularMarketDayLow")), 2),
-                        "source": ("Yahoo NIFTY Futures (proxy — not actual GIFT)" if is_real
-                                   else "⚠️ Yahoo Nifty 50 SPOT (GIFT unavailable — not a true pre-market indicator)"),
-                        "is_real_gift": False,  # Neither source is true GIFT Nifty
+                        "source": ("Yahoo NIFTY Futures (proxy — not actual GIFT)"
+                                   if is_futures else
+                                   "⚠️ Yahoo Nifty 50 SPOT (GIFT unavailable — not a true pre-market indicator)"),
+                        "is_real_gift": False,
                         "error": None,
                     })
                     break
             except Exception as e:
-                if not result.get("error"):
-                    result["error"] = f"Yahoo {sym}: {e}"
+                errors.append(f"Yahoo {sym}: {e}")
+
+    if result["price"] == 0 and errors:
+        result["error"] = " | ".join(errors[:3])
 
     chgp = result["chg_pct"]
     if result["price"] > 0:
